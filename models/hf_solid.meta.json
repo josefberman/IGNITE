@@ -1,0 +1,9 @@
+{
+  "name": "xgb_hf_solid",
+  "version": "1.0",
+  "property": "hf_solid",
+  "descriptor_dim": 119,
+  "units": "kJ/mol",
+  "path": "/home/josef/Projects/IGNITE/models/hf_solid.joblib",
+  "notes": "Descriptor contract v1-energeticgraph-compat; absolute-property regressor."
+}

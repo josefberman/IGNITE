@@ -1,0 +1,28 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../data:/app/data
+      - ../models:/app/models
+      - ../ml/checkpoints:/app/ml/checkpoints
+    environment:
+      IGNITE_DATABASE_URL: sqlite+aiosqlite:///./data/ignite.db
+      IGNITE_SEED_CSV: ./sample_start_molecules.csv
+      IGNITE_MODELS_DIR: ./models
+      IGNITE_CORS_ORIGINS: http://localhost:5173,http://localhost:3000
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # Optional Redis for future queue scaling
+  redis:
+    image: redis:7-alpine
+    profiles: ["queue"]
+    ports:
+      - "6379:6379"

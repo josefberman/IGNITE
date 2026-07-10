@@ -1,0 +1,9 @@
+{
+  "name": "xgb_det_pressure",
+  "version": "1.0",
+  "property": "det_pressure",
+  "descriptor_dim": 119,
+  "units": "GPa",
+  "path": "/home/josef/Projects/IGNITE/models/det_pressure.joblib",
+  "notes": "Descriptor contract v1-energeticgraph-compat; absolute-property regressor."
+}

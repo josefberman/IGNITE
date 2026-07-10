@@ -1,0 +1,72 @@
+:root {
+  font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  color: #e8eef7;
+  background: #0b1220;
+  line-height: 1.45;
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+.app { max-width: 1200px; margin: 0 auto; padding: 1.5rem; }
+header h1 { margin: 0 0 0.25rem; font-size: 1.6rem; letter-spacing: 0.04em; }
+header p { margin: 0 0 1rem; color: #9db0c9; }
+.disclaimer {
+  background: #2a1a12;
+  border: 1px solid #8a4b2a;
+  color: #ffd7bf;
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+}
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+.card {
+  background: #121a2b;
+  border: 1px solid #243149;
+  border-radius: 12px;
+  padding: 1rem;
+}
+.card h2 { margin-top: 0; font-size: 1.05rem; }
+label { display: block; font-size: 0.8rem; color: #9db0c9; margin-top: 0.55rem; }
+input[type="number"], input[type="text"] {
+  width: 100%;
+  margin-top: 0.2rem;
+  padding: 0.45rem 0.55rem;
+  border-radius: 8px;
+  border: 1px solid #314560;
+  background: #0b1220;
+  color: #e8eef7;
+}
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
+.checks { display: flex; flex-wrap: wrap; gap: 0.8rem; margin-top: 0.8rem; font-size: 0.9rem; }
+button {
+  margin-top: 1rem;
+  margin-right: 0.5rem;
+  background: #2f6fed;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  padding: 0.55rem 1rem;
+  cursor: pointer;
+  font-weight: 600;
+}
+button.secondary { background: #334155; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+.progress { font-family: ui-monospace, monospace; font-size: 0.85rem; color: #b7c7db; }
+.mol {
+  border-top: 1px solid #243149;
+  padding-top: 0.8rem;
+  margin-top: 0.8rem;
+}
+.mol code { color: #7dd3fc; word-break: break-all; }
+.badges span {
+  display: inline-block;
+  background: #1e293b;
+  border-radius: 999px;
+  padding: 0.15rem 0.55rem;
+  margin: 0.15rem 0.25rem 0.15rem 0;
+  font-size: 0.75rem;
+}
+table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+th, td { text-align: left; padding: 0.35rem; border-bottom: 1px solid #243149; }
+.error { color: #fda4af; }

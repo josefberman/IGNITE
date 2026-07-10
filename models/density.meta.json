@@ -1,0 +1,9 @@
+{
+  "name": "xgb_density",
+  "version": "1.0",
+  "property": "density",
+  "descriptor_dim": 119,
+  "units": "g/cm^3",
+  "path": "/home/josef/Projects/IGNITE/models/density.joblib",
+  "notes": "Descriptor contract v1-energeticgraph-compat; absolute-property regressor."
+}

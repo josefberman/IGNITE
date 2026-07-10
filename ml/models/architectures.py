@@ -1,0 +1,142 @@
+"""Graph Transformer-style parent encoder and hierarchical modification planner (PyTorch)."""
+
+from __future__ import annotations
+
+import math
+from typing import Dict, List, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from rdkit import Chem
+
+
+ATOM_LIST = [1, 5, 6, 7, 8, 9, 15, 16, 17, 35, 53]
+
+
+def mol_to_graph(smiles: str) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    atom_feats = []
+    for atom in mol.GetAtoms():
+        z = atom.GetAtomicNum()
+        onehot = [1.0 if z == a else 0.0 for a in ATOM_LIST]
+        onehot += [
+            float(atom.GetTotalDegree()),
+            float(atom.GetFormalCharge()),
+            float(atom.GetIsAromatic()),
+            float(atom.IsInRing()),
+        ]
+        atom_feats.append(onehot)
+    x = torch.tensor(atom_feats, dtype=torch.float32)
+    edges = []
+    for bond in mol.GetBonds():
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        edges.append([i, j])
+        edges.append([j, i])
+    if not edges:
+        edge_index = torch.zeros((2, 0), dtype=torch.long)
+    else:
+        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+    return x, edge_index
+
+
+class GraphTransformerEncoder(nn.Module):
+    def __init__(self, in_dim: int = len(ATOM_LIST) + 4, hidden: int = 128, layers: int = 3, heads: int = 4):
+        super().__init__()
+        self.input = nn.Linear(in_dim, hidden)
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden, nhead=heads, dim_feedforward=hidden * 2, batch_first=True, dropout=0.1
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=layers)
+        self.out = nn.Linear(hidden, hidden)
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # x: [B, N, F] — for simplicity callers can pass single-graph unsqueezed
+        h = self.input(x)
+        h = self.encoder(h, src_key_padding_mask=mask)
+        # mean pool over atoms
+        if mask is not None:
+            valid = (~mask).float().unsqueeze(-1)
+            h = (h * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1.0)
+        else:
+            h = h.mean(dim=1)
+        return self.out(h)
+
+
+class TargetDeltaEncoder(nn.Module):
+    def __init__(self, in_dim: int = 4, hidden: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+        )
+
+    def forward(self, delta: torch.Tensor) -> torch.Tensor:
+        return self.net(delta)
+
+
+class ModificationPlanner(nn.Module):
+    """Hierarchical: family → site → reagent."""
+
+    def __init__(self, n_families: int, n_reagents: int, hidden: int = 128):
+        super().__init__()
+        self.parent_enc = GraphTransformerEncoder(hidden=hidden)
+        self.delta_enc = TargetDeltaEncoder(hidden=hidden)
+        self.fuse = nn.Sequential(nn.Linear(hidden * 2, hidden), nn.ReLU())
+        self.family_head = nn.Linear(hidden, n_families)
+        self.site_head = nn.Linear(hidden, 1)  # applied per-atom via broadcast in training loop
+        self.reagent_head = nn.Linear(hidden, n_reagents)
+        self.atom_proj = nn.Linear(len(ATOM_LIST) + 4, hidden)
+
+    def encode(self, atom_x: torch.Tensor, delta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # atom_x: [1, N, F]
+        parent_z = self.parent_enc(atom_x)
+        delta_z = self.delta_enc(delta)
+        z = self.fuse(torch.cat([parent_z, delta_z], dim=-1))
+        return z, parent_z
+
+    def forward_family(self, z: torch.Tensor) -> torch.Tensor:
+        return self.family_head(z)
+
+    def forward_reagent(self, z: torch.Tensor) -> torch.Tensor:
+        return self.reagent_head(z)
+
+    def forward_sites(self, atom_x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        # returns [N] logits
+        atom_h = self.atom_proj(atom_x.squeeze(0))
+        scores = (atom_h * z).sum(dim=-1) / math.sqrt(atom_h.size(-1))
+        return scores
+
+
+class DeltaPropertyPredictor(nn.Module):
+    def __init__(self, hidden: int = 128, out_dim: int = 4):
+        super().__init__()
+        self.parent_enc = GraphTransformerEncoder(hidden=hidden)
+        self.child_enc = GraphTransformerEncoder(hidden=hidden)
+        self.head = nn.Sequential(
+            nn.Linear(hidden * 2, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, out_dim),
+        )
+
+    def forward(self, parent_x: torch.Tensor, child_x: torch.Tensor) -> torch.Tensor:
+        p = self.parent_enc(parent_x)
+        c = self.child_enc(child_x)
+        return self.head(torch.cat([p, c], dim=-1))
+
+
+class UncertaintyEnsemble(nn.Module):
+    def __init__(self, models: List[DeltaPropertyPredictor]):
+        super().__init__()
+        self.models = nn.ModuleList(models)
+
+    def forward(self, parent_x: torch.Tensor, child_x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        preds = torch.stack([m(parent_x, child_x) for m in self.models], dim=0)
+        mean = preds.mean(dim=0)
+        std = preds.std(dim=0)
+        return mean, std
