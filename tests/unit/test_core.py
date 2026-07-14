@@ -39,11 +39,12 @@ def test_target_validation():
     TargetProperties(density=1.8, det_velocity=8500, det_pressure=30, hf_solid=100)
 
 
-def test_uncertainty_interval_widens_with_low_confidence():
+def test_calibrate_estimate_drops_intervals():
     est = PropertyEstimate(value=100.0, source=PredictionSource.XGBOOST, confidence=0.6)
     cal = calibrate_estimate(est, ood_distance=0.5)
-    assert cal.lower is not None and cal.upper is not None
-    assert cal.upper > cal.lower
+    assert cal.value == 100.0
+    assert cal.lower is None and cal.upper is None
+    assert cal.source == PredictionSource.XGBOOST
 
 
 def test_score_prefers_lower_mape():

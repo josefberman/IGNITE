@@ -27,17 +27,19 @@ PROPERTY_RANGES = {
 class PredictionSource(str, Enum):
     DATASET = "dataset"
     LITERATURE = "literature"
-    ANALOGUE = "analogue"
     XGBOOST = "xgboost"
     DELTA_MODEL = "delta_model"
     UNKNOWN = "unknown"
+    # Deprecated — retained so old job JSON still deserializes
+    ANALOGUE = "analogue"
 
 
 class NoveltyStatus(str, Enum):
     KNOWN = "known"
-    CLOSE_ANALOGUE = "close_analogue"
     NO_MATCH_FOUND = "no_match_found"
     INCOMPLETE_SEARCH = "incomplete_search"
+    # Deprecated — retained for old job JSON
+    CLOSE_ANALOGUE = "close_analogue"
 
 
 class JobStatus(str, Enum):
@@ -72,10 +74,10 @@ class TargetProperties(BaseModel):
 
 
 class BeamParameters(BaseModel):
-    depth: int = Field(5, ge=1, le=50, description="Beam depth X")
-    width: int = Field(8, ge=1, le=100, description="Expansions per node N")
+    depth: int = Field(10, ge=1, le=50, description="Beam depth")
+    width: int = Field(5, ge=1, le=100, description="Expansions per node")
     top_k: int = Field(5, ge=1, le=50, description="Survivors per iteration K")
-    mape_threshold: float = Field(5.0, ge=0.0, le=100.0)
+    mape_threshold: float = Field(1.0, ge=0.0, le=100.0)
     random_seed: int = Field(42, ge=0)
     enable_literature: bool = True
     enable_patent_search: bool = True
@@ -86,10 +88,7 @@ class ScoreBreakdown(BaseModel):
     mape: float
     mape_normalized: float
     sascore_penalty: float
-    uncertainty_penalty: float
-    safety_penalty: float
     minimal_edit_penalty: float
-    novelty_bonus: float = 0.0
     total: float
     weights: Dict[str, float] = Field(default_factory=dict)
 
@@ -97,6 +96,7 @@ class ScoreBreakdown(BaseModel):
 class PropertyEstimate(BaseModel):
     value: float
     source: PredictionSource = PredictionSource.UNKNOWN
+    # Retained for internal/legacy job JSON; not reported in the GUI.
     confidence: float = Field(0.5, ge=0.0, le=1.0)
     lower: Optional[float] = None
     upper: Optional[float] = None
@@ -104,17 +104,18 @@ class PropertyEstimate(BaseModel):
 
 
 class SafetyFinding(BaseModel):
+    """Internal hard-gate / SAScore signal — not returned to clients."""
+
     score: float = Field(..., ge=0.0, le=1.0, description="0=safer, 1=higher risk")
     is_acceptable: bool = True
     sascore: float = 5.0
     unstable_motifs: List[str] = Field(default_factory=list)
     notes: List[str] = Field(default_factory=list)
-    disclaimer: str = (
-        "Computational heuristic only — not a safety certification or hazard clearance."
-    )
 
 
 class NoveltyEvidence(BaseModel):
+    """Internal novelty-gate signal — not returned to clients."""
+
     status: NoveltyStatus = NoveltyStatus.INCOMPLETE_SEARCH
     score: float = Field(0.0, ge=0.0, le=1.0, description="1=more novel")
     max_tanimoto_to_seeds: Optional[float] = None
@@ -146,8 +147,8 @@ class CandidateMolecule(BaseModel):
     properties: Dict[str, PropertyEstimate] = Field(default_factory=dict)
     mape: float = 100.0
     score: ScoreBreakdown | None = None
-    safety: SafetyFinding | None = None
-    novelty: NoveltyEvidence | None = None
+    safety: SafetyFinding | None = Field(default=None, exclude=True)
+    novelty: NoveltyEvidence | None = Field(default=None, exclude=True)
     modification: ModificationRecord | None = None
     lineage: List[str] = Field(default_factory=list)
     rejected: bool = False
@@ -155,6 +156,23 @@ class CandidateMolecule(BaseModel):
 
     def property_values(self) -> Dict[str, float]:
         return {k: v.value for k, v in self.properties.items()}
+
+    def strip_internal_signals(self) -> "CandidateMolecule":
+        """Drop safety/novelty and uncertainty fields before client-facing export."""
+        self.safety = None
+        self.novelty = None
+        cleaned: Dict[str, PropertyEstimate] = {}
+        for key, est in self.properties.items():
+            cleaned[key] = PropertyEstimate(
+                value=est.value,
+                source=est.source,
+                confidence=0.5,
+                lower=None,
+                upper=None,
+                citation=None,
+            )
+        self.properties = cleaned
+        return self
 
 
 class SearchRequest(BaseModel):
@@ -172,7 +190,6 @@ class SearchProgress(BaseModel):
     rejected_count: int = 0
     best_mape: Optional[float] = None
     best_score: Optional[float] = None
-    best_uncertainty: Optional[float] = None
     message: str = ""
 
 
@@ -183,8 +200,8 @@ class SearchResult(BaseModel):
     top_k: List[CandidateMolecule] = Field(default_factory=list)
     progress: SearchProgress
     disclaimer: str = (
-        "Outputs are computational candidates with uncertainty and hazard flags. "
-        "They are not safety certifications, legal novelty opinions, or patentability advice."
+        "Outputs are computational design candidates only — not experimental validation "
+        "or a legal novelty / patentability opinion."
     )
 
 

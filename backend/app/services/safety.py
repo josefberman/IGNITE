@@ -97,7 +97,8 @@ def estimate_safety(smiles: str) -> SafetyFinding:
         notes.append("High synthetic accessibility score")
     return SafetyFinding(
         score=score,
-        is_acceptable=score < 0.85 and "peroxide" not in motifs,
+        # Energetic motifs (e.g. azide) are penalized in ranking, not hard-rejected.
+        is_acceptable=score < 0.95 and "peroxide" not in motifs and "invalid" not in motifs,
         sascore=sas,
         unstable_motifs=motifs,
         notes=notes,

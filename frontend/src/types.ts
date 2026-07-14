@@ -26,7 +26,6 @@ export type SearchProgress = {
   rejected_count: number;
   best_mape?: number;
   best_score?: number;
-  best_uncertainty?: number;
   message: string;
 };
 
@@ -37,19 +36,18 @@ export type CandidateMolecule = {
   inchikey?: string;
   generation: number;
   mape: number;
-  properties: Record<string, { value: number; source: string; confidence: number; lower?: number; upper?: number }>;
+  properties: Record<
+    string,
+    { value: number; source: string; confidence?: number; lower?: number; upper?: number; citation?: string }
+  >;
   score?: {
     mape: number;
     total: number;
     mape_normalized: number;
     sascore_penalty: number;
-    uncertainty_penalty: number;
-    safety_penalty: number;
     minimal_edit_penalty: number;
-    novelty_bonus: number;
+    weights?: Record<string, number>;
   };
-  safety?: { score: number; is_acceptable: boolean; sascore: number; unstable_motifs: string[]; notes: string[]; disclaimer: string };
-  novelty?: { status: string; score: number; notes: string[]; providers_checked: string[]; providers_unavailable: string[] };
   modification?: { reaction_family: string; edit_distance: number; planner: string };
   lineage: string[];
 };

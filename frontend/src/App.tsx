@@ -1,6 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { cancelSearch, createSearch, getProgress, getResult } from "./api/client";
-import type { BeamParameters, CandidateMolecule, SearchProgress, SearchResult, TargetProperties } from "./types";
+import type {
+  BeamParameters,
+  CandidateMolecule,
+  SearchProgress,
+  SearchResult,
+  TargetProperties,
+} from "./types";
 
 const DEFAULT_TARGETS: TargetProperties = {
   density: 1.8,
@@ -10,54 +16,130 @@ const DEFAULT_TARGETS: TargetProperties = {
 };
 
 const DEFAULT_BEAM: BeamParameters = {
-  depth: 3,
-  width: 4,
+  depth: 10,
+  width: 5,
   top_k: 3,
-  mape_threshold: 8,
+  mape_threshold: 1,
   random_seed: 42,
   enable_literature: true,
   enable_patent_search: true,
   novelty_as_gate: false,
 };
 
+function StructureImage({ smiles, size = 220 }: { smiles: string; size?: number }) {
+  const src = `/api/v1/molecule/depict?smiles=${encodeURIComponent(smiles)}&size=${size}`;
+  return (
+    <div className="structure">
+      <img src={src} alt={`2D structure for ${smiles}`} width={size} height={size} loading="lazy" />
+    </div>
+  );
+}
+
+function ScoringGuide() {
+  return (
+    <section className="card scoring-guide">
+      <h2>How candidate scoring works</h2>
+      <p>
+        After each beam iteration, every valid molecule receives a <strong>total score</strong> (lower is better).
+        Candidates are ranked by this total; the top <em>K</em> survive to the next iteration, and the lowest-scoring
+        molecule is returned as the best result.
+      </p>
+
+      <h3>1. Property MAPE (weight 0.65)</h3>
+      <p>
+        Mean Absolute Percentage Error across density, detonation velocity, detonation pressure, and Hf solid
+        (equal weights 0.25 each):
+      </p>
+      <pre>MAPE% = average_i( |pred_i − target_i| / |target_i| × 100 )</pre>
+      <p>
+        For ranking this is normalized to <code>mape_normalized = min(MAPE% / 100, 1)</code> so 0% error → 0 and
+        ≥100% error → 1.
+      </p>
+
+      <h3>2. Synthetic accessibility / SAScore penalty (weight 0.25)</h3>
+      <p>
+        RDKit SAScore (≈1 easy … 10 hard) is mapped to [0, 1]. Lower values mean easier synthesis and contribute less
+        penalty.
+      </p>
+
+      <h3>3. Minimal-edit penalty (weight 0.10)</h3>
+      <p>
+        Prefers simpler modifications: <code>edit = min(1, atom_count_delta / 10)</code>. Seeds (no edit) score 0 here.
+      </p>
+
+      <h3>Combined total (lower is better)</h3>
+      <pre>
+{`total =
+  0.65 × mape_normalized
++ 0.25 × sascore_penalty
++ 0.10 × minimal_edit_penalty`}
+      </pre>
+      <p>
+        During search (while best MAPE is above the threshold), an explore mode temporarily raises the MAPE weight
+        and lightly penalizes unedited dataset seeds so generated children can enter the beam. Final displayed
+        rankings use the weights above. Optional novelty gate (user input) can hard-reject known molecules
+        without changing the ranking formula.
+      </p>
+    </section>
+  );
+}
+
 function MoleculeCard({ title, mol }: { title: string; mol: CandidateMolecule }) {
   const props = mol.properties || {};
   return (
     <div className="mol">
       <h3>{title}</h3>
-      <div><code>{mol.canonical_smiles}</code></div>
-      <div className="badges">
-        <span>MAPE {mol.mape?.toFixed(2)}%</span>
-        {mol.score && <span>Score {mol.score.total.toFixed(3)}</span>}
-        {mol.novelty && <span>Novelty {mol.novelty.status}</span>}
-        {mol.safety && <span>Safety risk {mol.safety.score.toFixed(2)}</span>}
-        {mol.modification && <span>{mol.modification.reaction_family}</span>}
+      <div className="mol-layout">
+        <StructureImage smiles={mol.canonical_smiles} />
+        <div className="mol-meta">
+          <div><code>{mol.canonical_smiles}</code></div>
+          {mol.inchikey ? <div className="progress">InChIKey: {mol.inchikey}</div> : null}
+          <div className="badges">
+            <span>MAPE {mol.mape?.toFixed(2)}%</span>
+            {mol.score && <span>Score {mol.score.total.toFixed(3)}</span>}
+            {mol.modification && <span>{mol.modification.reaction_family}</span>}
+            <span>gen {mol.generation}</span>
+            {Object.values(props)[0] && <span>source {Object.values(props)[0].source}</span>}
+          </div>
+        </div>
       </div>
       <table>
         <thead>
-          <tr><th>Property</th><th>Value</th><th>Interval</th><th>Source</th><th>Conf.</th></tr>
+          <tr><th>Property</th><th>Value</th><th>Source</th></tr>
         </thead>
         <tbody>
           {Object.entries(props).map(([k, v]) => (
             <tr key={k}>
               <td>{k}</td>
               <td>{v.value.toFixed(3)}</td>
-              <td>{v.lower != null && v.upper != null ? `[${v.lower.toFixed(2)}, ${v.upper.toFixed(2)}]` : "—"}</td>
               <td>{v.source}</td>
-              <td>{(v.confidence * 100).toFixed(0)}%</td>
             </tr>
           ))}
         </tbody>
       </table>
       {mol.score && (
-        <p className="progress">
-          penalties: SA {mol.score.sascore_penalty.toFixed(2)} · unc {mol.score.uncertainty_penalty.toFixed(2)} ·
-          safety {mol.score.safety_penalty.toFixed(2)} · edit {mol.score.minimal_edit_penalty.toFixed(2)}
-        </p>
+        <div className="score-breakdown progress">
+          <div>Score breakdown (lower better)</div>
+          <div>
+            MAPE {mol.score.mape.toFixed(2)}% (norm {mol.score.mape_normalized.toFixed(3)}) ·
+            SA {mol.score.sascore_penalty.toFixed(3)} ·
+            edit {mol.score.minimal_edit_penalty.toFixed(3)} ·
+            <strong> total {mol.score.total.toFixed(3)}</strong>
+          </div>
+        </div>
       )}
-      {mol.novelty?.notes?.length ? <p className="progress">{mol.novelty.notes.join(" · ")}</p> : null}
-      {mol.lineage?.length ? <p className="progress">Lineage: {mol.lineage.join(" → ")} → {mol.canonical_smiles}</p> : null}
-      {mol.safety?.disclaimer ? <p className="progress">{mol.safety.disclaimer}</p> : null}
+      {mol.lineage?.length ? (
+        <div className="lineage">
+          <p className="progress">Modification lineage</p>
+          <div className="lineage-row">
+            {mol.lineage.map((s) => (
+              <StructureImage key={s} smiles={s} size={120} />
+            ))}
+            <StructureImage smiles={mol.canonical_smiles} size={120} />
+          </div>
+          <p className="progress">{[...mol.lineage, mol.canonical_smiles].join(" → ")}</p>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -119,12 +201,14 @@ export default function App() {
     <div className="app">
       <header>
         <h1>IGNITE</h1>
-        <p>Learned energetic-material generation with beam search, uncertainty, safety, and novelty evidence.</p>
+        <p>Intelligent Generation and Navigation through Iterative Transformations of Energetics</p>
       </header>
       <div className="disclaimer">
-        Computational candidates only. Not a safety certification, legal novelty opinion, or patentability advice.
-        Unavailable novelty providers are reported as incomplete — never as “novel.”
+        Computational design candidates only — not experimental validation or a legal novelty / patentability opinion.
       </div>
+
+      <ScoringGuide />
+
       <div className="grid">
         <section className="card">
           <h2>Target properties</h2>
@@ -149,11 +233,11 @@ export default function App() {
           <h2 style={{ marginTop: "1.2rem" }}>Beam parameters</h2>
           <div className="row">
             <div>
-              <label>Depth X</label>
+              <label>Depth</label>
               <input type="number" value={beam.depth} onChange={(e) => setB("depth", +e.target.value)} />
             </div>
             <div>
-              <label>Width N</label>
+              <label>Width</label>
               <input type="number" value={beam.width} onChange={(e) => setB("width", +e.target.value)} />
             </div>
             <div>
@@ -166,8 +250,7 @@ export default function App() {
             </div>
           </div>
           <div className="checks">
-            <label><input type="checkbox" checked={beam.enable_literature} onChange={(e) => setB("enable_literature", e.target.checked)} /> Literature</label>
-            <label><input type="checkbox" checked={beam.enable_patent_search} onChange={(e) => setB("enable_patent_search", e.target.checked)} /> Patents</label>
+            <label><input type="checkbox" checked={beam.enable_literature} onChange={(e) => setB("enable_literature", e.target.checked)} /> Literature properties</label>
             <label><input type="checkbox" checked={beam.novelty_as_gate} onChange={(e) => setB("novelty_as_gate", e.target.checked)} /> Novelty gate</label>
           </div>
           <button onClick={onStart} disabled={running}>Start search</button>
@@ -189,7 +272,6 @@ export default function App() {
               <div>Generated: {progress.candidates_generated} · Rejected: {progress.rejected_count}</div>
               <div>Best MAPE: {progress.best_mape?.toFixed(2) ?? "—"}%</div>
               <div>Best score: {progress.best_score?.toFixed(4) ?? "—"}</div>
-              <div>Uncertainty: {progress.best_uncertainty?.toFixed(3) ?? "—"}</div>
               <div>{progress.message}</div>
             </div>
           ) : (

@@ -11,7 +11,7 @@ from typing import AsyncIterator, List
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from sse_starlette.sse import EventSourceResponse
 
 from backend.app.core.config import get_settings
@@ -22,15 +22,16 @@ from backend.app.domain.models import (
     SearchProgress,
     SearchRequest,
     SearchResult,
-    TargetProperties,
 )
 from backend.app.db.jobs import JobStore
 from backend.app.services.beam_search import BeamSearchController
 from backend.app.services.modification import ModificationMechanism
+from backend.app.services.molecule_identity import MoleculeIdentityResolver
 from backend.app.services.novelty import NoveltyService
 from backend.app.services.prediction import PropertyPredictor
 from backend.app.services.property_estimator import LiteratureRetriever, PropertyEstimator
 from backend.app.services.seed_selector import SeedLibrary
+from backend.app.services.structure import smiles_to_png
 
 settings = get_settings()
 settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -39,19 +40,24 @@ store = JobStore(str(settings.database_url))
 _controllers: dict[str, BeamSearchController] = {}
 
 
-def _build_controller() -> BeamSearchController:
+def _build_controller(beam: BeamParameters | None = None) -> BeamSearchController:
     seeds = SeedLibrary(settings.seed_csv)
     predictor = PropertyPredictor(settings.models_dir)
-    estimator = PropertyEstimator(
-        predictor,
-        LiteratureRetriever(enabled=True),
-    )
+    literature = LiteratureRetriever(enabled=True)
+    # Exact experimental seed values only (no analogue transfer)
+    literature.load_seed_library(seeds.df.to_dict(orient="records"))
+    if beam is not None:
+        literature.enabled = bool(beam.enable_literature)
+
+    estimator = PropertyEstimator(predictor, literature)
+    identity = MoleculeIdentityResolver()
     novelty = NoveltyService(
         seed_smiles=seeds.all_canonical_smiles(),
-        pubchem_enabled=settings.pubchem_enabled,
-        openalex_enabled=settings.openalex_enabled,
-        epo_ops_key=settings.epo_ops_key,
-        lens_api_key=settings.lens_api_key,
+        pubchem_enabled=settings.pubchem_enabled and (beam.enable_literature if beam else True),
+        openalex_enabled=settings.openalex_enabled and (beam.enable_literature if beam else True),
+        epo_ops_key=settings.epo_ops_key if (beam is None or beam.enable_patent_search) else "",
+        lens_api_key=settings.lens_api_key if (beam is None or beam.enable_patent_search) else "",
+        identity_resolver=identity,
     )
     mod = ModificationMechanism(checkpoint_dir=settings.learned_checkpoint_dir)
     return BeamSearchController(seeds, estimator, novelty, mod)
@@ -74,7 +80,7 @@ def _run_job(job_id: str) -> None:
     try:
         req = store.get_request(job_id)
         beam = _clamp_beam(req.beam)
-        controller = _build_controller()
+        controller = _build_controller(beam)
         _controllers[job_id] = controller
 
         def on_progress(progress: SearchProgress, _best) -> None:
@@ -123,6 +129,16 @@ app.add_middleware(
 @app.get("/api/v1/health")
 def health():
     return {"status": "ok", "service": "ignite"}
+
+
+@app.get("/api/v1/molecule/depict")
+def depict_molecule(smiles: str, size: int = 320):
+    """Return a 2D PNG depiction of the molecule (RDKit)."""
+    size = max(64, min(int(size), 800))
+    png = smiles_to_png(smiles, size=size)
+    if png is None:
+        raise HTTPException(400, "Invalid SMILES")
+    return Response(content=png, media_type="image/png")
 
 
 @app.get("/api/v1/models", response_model=List[ModelMetadata])
@@ -203,7 +219,7 @@ def export_csv(job_id: str):
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(
-        ["rank", "smiles", "mape", "score", "density", "det_velocity", "det_pressure", "hf_solid", "novelty", "safety"]
+        ["rank", "smiles", "mape", "score", "density", "det_velocity", "det_pressure", "hf_solid"]
     )
     for i, c in enumerate(result.top_k, 1):
         props = c.property_values()
@@ -217,8 +233,6 @@ def export_csv(job_id: str):
                 props.get("det_velocity", ""),
                 props.get("det_pressure", ""),
                 props.get("hf_solid", ""),
-                c.novelty.status.value if c.novelty else "",
-                c.safety.score if c.safety else "",
             ]
         )
     buf.seek(0)

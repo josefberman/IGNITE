@@ -2,13 +2,20 @@
 
 Learned energetic-material generation platform with a web GUI.
 
-Given target energetic properties and beam-search parameters, IGNITE selects MAPE-close seeds, expands candidates via a learned (or rule-based fallback) modification planner, estimates properties with literature/XGBoost sources, scores uncertainty/safety/novelty, and returns the best molecule with an audit trail.
+Given target energetic properties and beam-search parameters, IGNITE selects MAPE-close seeds, expands candidates via a learned (or rule-based fallback) modification planner, estimates properties with literature/XGBoost sources, ranks by MAPE + SAScore + minimal-edit, and returns the best molecule with an audit trail. An optional novelty gate can hard-reject exact known molecules.
 
-**Outputs are computational candidates only — not safety certifications, legal novelty opinions, or patentability advice.**
+**Outputs are computational candidates only — not experimental validation or a legal novelty / patentability opinion.** Safety, uncertainty, and novelty evidence are not reported in the UI.
 
 ## Architecture
 
-See [docs/architecture/TRACEABILITY.md](docs/architecture/TRACEABILITY.md) and the supplied diagrams in `docs/architecture/`.
+See the full system monograph:
+
+- **[IGNITE System Thesis](docs/IGNITE_System_Thesis.md)** — end-to-end flow, algorithms, scores, gates, and limitations
+
+Also: [docs/architecture/TRACEABILITY.md](docs/architecture/TRACEABILITY.md) and the diagrams in `docs/architecture/`:
+
+- [High-level architecture](docs/architecture/IGNITE_High_Level_Architecture.png)
+- [Modification architecture](docs/architecture/IGNITE_Modification_Architecture.png)
 
 ## Quick start
 
@@ -17,8 +24,10 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 python scripts/write_model_metadata.py
 python scripts/normalize_seeds.py
-uvicorn backend.app.main:app --reload --port 8000
+uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8080
 ```
+
+> **Note:** Use port **8080** by default. Port 8000 is often claimed by the HPLIP printer web UI on Linux, which returns bare `400 - Bad Request` for API calls.
 
 Frontend:
 
@@ -26,7 +35,7 @@ Frontend:
 cd frontend && npm install && npm run dev
 ```
 
-Open http://localhost:5173
+Open http://localhost:5173 (Vite proxies `/api` → `http://127.0.0.1:8080`)
 
 ## Training the learned modification stack
 

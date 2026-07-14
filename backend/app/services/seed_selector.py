@@ -90,7 +90,7 @@ class SeedLibrary:
                 inchikey=row.get("inchikey"),
                 generation=0,
                 properties={
-                    k: PropertyEstimate(value=props[k], source=PredictionSource.DATASET, confidence=1.0)
+                    k: PropertyEstimate(value=props[k], source=PredictionSource.DATASET, confidence=0.9)
                     for k in PROPERTY_KEYS
                 },
                 mape=mape,

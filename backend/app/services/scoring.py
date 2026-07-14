@@ -7,17 +7,16 @@ from typing import Dict, Optional
 from backend.app.domain.models import (
     PROPERTY_KEYS,
     CandidateMolecule,
-    NoveltyStatus,
+    PredictionSource,
     ScoreBreakdown,
 )
 
 
+# Final ranking uses MAPE, synthetic accessibility, and minimal-edit only.
 DEFAULT_WEIGHTS = {
-    "mape": 0.45,
-    "sascore": 0.15,
-    "uncertainty": 0.20,
-    "safety": 0.15,
-    "minimal_edit": 0.05,
+    "mape": 0.65,
+    "sascore": 0.25,
+    "minimal_edit": 0.10,
 }
 
 
@@ -43,60 +42,51 @@ def calculate_mape(
     return mape / total_w if total_w > 0 else 100.0
 
 
-def mean_uncertainty(candidate: CandidateMolecule) -> float:
-    if not candidate.properties:
-        return 1.0
-    vals = []
-    for est in candidate.properties.values():
-        # confidence 1 → uncertainty 0
-        vals.append(1.0 - float(est.confidence))
-        if est.lower is not None and est.upper is not None and abs(est.value) > 1e-8:
-            width = (est.upper - est.lower) / (2.0 * abs(est.value))
-            vals.append(min(1.0, max(0.0, width)))
-    return sum(vals) / len(vals) if vals else 1.0
-
-
 def score_candidate(
     candidate: CandidateMolecule,
     target: Dict[str, float],
     weights: Optional[Dict[str, float]] = None,
     max_edit: int = 10,
+    *,
+    explore: bool = False,
 ) -> ScoreBreakdown:
+    """
+    Ranking score (lower is better): MAPE + SAScore + minimal-edit.
+
+    Hard safety rejection and optional novelty gating happen upstream in beam search.
+    Safety / uncertainty / novelty are not reported to clients.
+    """
     w = {**DEFAULT_WEIGHTS, **(weights or {})}
+    if explore:
+        w = {**w, "mape": 0.85, "sascore": 0.10, "minimal_edit": 0.05}
+
     props = candidate.property_values()
     mape = calculate_mape(props, target)
     mape_norm = min(mape / 100.0, 1.0)
 
     sas = candidate.safety.score if candidate.safety else 0.5
-    unc = mean_uncertainty(candidate)
-    safety = candidate.safety.score if candidate.safety else 0.5
     edit = 0.0
     if candidate.modification:
         edit = min(1.0, candidate.modification.edit_distance / max(1, max_edit))
 
-    novelty_bonus = 0.0
-    if candidate.novelty:
-        if candidate.novelty.status == NoveltyStatus.NO_MATCH_FOUND:
-            novelty_bonus = 0.05 * candidate.novelty.score
-        elif candidate.novelty.status == NoveltyStatus.KNOWN:
-            novelty_bonus = -0.02
+    # Dataset seeds should not freeze the search while exploring.
+    seed_stagnation = 0.0
+    if explore and candidate.generation == 0:
+        sources = {est.source for est in candidate.properties.values()}
+        if PredictionSource.DATASET in sources:
+            seed_stagnation = 0.04
 
     total = (
         w["mape"] * mape_norm
         + w["sascore"] * sas
-        + w["uncertainty"] * unc
-        + w["safety"] * safety
         + w["minimal_edit"] * edit
-        - novelty_bonus
+        + seed_stagnation
     )
     return ScoreBreakdown(
         mape=mape,
         mape_normalized=mape_norm,
         sascore_penalty=sas,
-        uncertainty_penalty=unc,
-        safety_penalty=safety,
         minimal_edit_penalty=edit,
-        novelty_bonus=novelty_bonus,
         total=total,
         weights=w,
     )

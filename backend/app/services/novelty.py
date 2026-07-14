@@ -1,14 +1,16 @@
-"""Novelty screening: local fingerprints + optional literature/patent providers."""
+"""Novelty screening via exact identifiers: SMILES, IUPAC, commercial names."""
 
 from __future__ import annotations
 
 import logging
 from typing import Dict, List, Optional, Sequence
+from urllib.parse import quote
 
 import httpx
 
 from backend.app.domain.models import NoveltyEvidence, NoveltyStatus
-from backend.app.services.chemistry import canonicalize, inchikey_of, morgan_fp_bits, tanimoto
+from backend.app.services.chemistry import canonicalize
+from backend.app.services.molecule_identity import MoleculeIdentity, MoleculeIdentityResolver
 
 logger = logging.getLogger(__name__)
 
@@ -21,92 +23,150 @@ class NoveltyService:
         openalex_enabled: bool = True,
         epo_ops_key: str = "",
         lens_api_key: str = "",
-        close_analogue_threshold: float = 0.85,
+        identity_resolver: Optional[MoleculeIdentityResolver] = None,
     ):
-        self.seed_smiles = list(seed_smiles)
-        self.seed_fps = []
-        for s in self.seed_smiles:
-            fp = morgan_fp_bits(s)
-            if fp is not None:
-                self.seed_fps.append((s, fp))
+        self.seed_smiles = set(canonicalize(s) or s for s in seed_smiles)
         self.pubchem_enabled = pubchem_enabled
         self.openalex_enabled = openalex_enabled
         self.epo_ops_key = epo_ops_key
         self.lens_api_key = lens_api_key
-        self.close_analogue_threshold = close_analogue_threshold
+        self.identity = identity_resolver or MoleculeIdentityResolver()
         self._cache: Dict[str, NoveltyEvidence] = {}
 
-    def _local_similarity(self, smiles: str) -> tuple[Optional[float], Optional[str]]:
-        from rdkit import DataStructs
-
-        fp = morgan_fp_bits(smiles)
-        if fp is None or not self.seed_fps:
-            return None, None
-        best = -1.0
-        nearest = None
-        for s, sfp in self.seed_fps:
-            sim = float(DataStructs.TanimotoSimilarity(fp, sfp))
-            if sim > best:
-                best = sim
-                nearest = s
-        return best, nearest
-
-    def _query_pubchem(self, inchikey: str) -> tuple[List[dict], bool]:
+    def _query_pubchem_exact(self, identity: MoleculeIdentity) -> tuple[List[dict], bool]:
         if not self.pubchem_enabled:
             return [], False
-        url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/inchikey/{inchikey}/cids/JSON"
+        hits: List[dict] = []
         try:
-            r = httpx.get(url, timeout=8.0)
-            if r.status_code == 404:
-                return [], True
-            if r.status_code != 200:
-                return [], False
-            cids = r.json().get("IdentifierList", {}).get("CID", [])
-            return [{"provider": "pubchem", "cid": c} for c in cids[:5]], True
+            if identity.cid is not None:
+                hits.append(
+                    {
+                        "provider": "pubchem",
+                        "cid": identity.cid,
+                        "iupac": identity.iupac_name,
+                        "commercial_names": identity.commercial_names[:5],
+                        "query": "exact SMILES",
+                        "url": f"https://pubchem.ncbi.nlm.nih.gov/compound/{identity.cid}",
+                        "title": identity.iupac_name
+                        or (identity.commercial_names[0] if identity.commercial_names else f"CID {identity.cid}"),
+                    }
+                )
+                return hits, True
+            # No CID ⇒ exact structure not in PubChem
+            return [], True
         except Exception as e:
             logger.debug("PubChem unavailable: %s", e)
             return [], False
 
-    def _query_openalex(self, smiles: str) -> tuple[List[dict], bool]:
+    def _query_openalex(self, identity: MoleculeIdentity) -> tuple[List[dict], bool]:
         if not self.openalex_enabled:
             return [], False
-        # Conservative metadata search by InChIKey substring if available
-        key = inchikey_of(smiles) or smiles[:40]
-        url = "https://api.openalex.org/works"
-        try:
-            r = httpx.get(url, params={"search": key, "per_page": 3}, timeout=8.0)
-            if r.status_code != 200:
-                return [], False
-            results = []
-            for w in r.json().get("results", [])[:3]:
-                results.append(
-                    {
-                        "provider": "openalex",
-                        "id": w.get("id"),
-                        "title": w.get("display_name"),
-                        "doi": (w.get("doi") or ""),
-                    }
-                )
-            return results, True
-        except Exception as e:
-            logger.debug("OpenAlex unavailable: %s", e)
-            return [], False
+        results: List[dict] = []
+        checked_ok = False
+        # Prefer human names; also try SMILES / InChIKey for exact-molecule mentions
+        terms = []
+        if identity.iupac_name:
+            terms.append(identity.iupac_name)
+        terms.extend(identity.commercial_names[:5])
+        if identity.inchikey:
+            terms.append(identity.inchikey)
+        terms.append(identity.canonical_smiles)
 
-    def _query_patents(self, smiles: str) -> tuple[List[dict], List[str], List[str]]:
+        for term in terms[:6]:
+            try:
+                r = httpx.get(
+                    "https://api.openalex.org/works",
+                    params={"search": term, "per_page": 3},
+                    timeout=8.0,
+                    headers={"User-Agent": "IGNITE/0.1 (research; mailto:ignite@local)"},
+                )
+                if r.status_code != 200:
+                    continue
+                checked_ok = True
+                for w in r.json().get("results", [])[:3]:
+                    openalex_id = w.get("id") or ""
+                    doi = (w.get("doi") or "").strip()
+                    doi_url = doi if doi.startswith("http") else (f"https://doi.org/{doi.replace('https://doi.org/', '')}" if doi else "")
+                    results.append(
+                        {
+                            "provider": "openalex",
+                            "id": openalex_id,
+                            "title": w.get("display_name"),
+                            "doi": doi,
+                            "query": term,
+                            "url": doi_url or openalex_id,
+                        }
+                    )
+                if results:
+                    break
+            except Exception as e:
+                logger.debug("OpenAlex unavailable for %s: %s", term[:40], e)
+        return results, checked_ok
+
+    def _query_patents(self, identity: MoleculeIdentity) -> tuple[List[dict], List[str], List[str]]:
         hits: List[dict] = []
         checked: List[str] = []
         unavailable: List[str] = []
+
+        # Build exact-molecule patent query strings
+        queries = []
+        if identity.iupac_name:
+            queries.append(identity.iupac_name)
+        queries.extend(identity.commercial_names[:4])
+        if identity.inchikey:
+            queries.append(identity.inchikey)
+        queries.append(identity.canonical_smiles)
+
         if self.lens_api_key:
             checked.append("lens")
-            # Credential present but full Lens query requires paid schema; mark incomplete.
+            # Lens full-text search requires configured schema; record queries attempted.
             unavailable.append("lens_query_not_configured")
+            for q in queries[:3]:
+                hits.append(
+                    {
+                        "provider": "lens",
+                        "status": "not_queried",
+                        "query": q,
+                        "note": "API key present but Lens query schema not configured",
+                        "url": f"https://www.lens.org/lens/search/patent/list?q={quote(q)}",
+                        "title": f"Lens search: {q}",
+                    }
+                )
         else:
             unavailable.append("lens")
+
         if self.epo_ops_key:
             checked.append("epo_ops")
             unavailable.append("epo_ops_query_not_configured")
+            for q in queries[:3]:
+                hits.append(
+                    {
+                        "provider": "epo_ops",
+                        "status": "not_queried",
+                        "query": q,
+                        "note": "API key present but EPO OPS client not configured",
+                        "url": f"https://worldwide.espacenet.com/patent/search?q={quote(q)}",
+                        "title": f"Espacenet search: {q}",
+                    }
+                )
         else:
             unavailable.append("epo_ops")
+
+        # Public Google Patents deep-link evidence (no scrape; user-verifiable)
+        if queries:
+            checked.append("google_patents_link")
+            q = queries[0]
+            hits.append(
+                {
+                    "provider": "google_patents",
+                    "status": "link_only",
+                    "query": q,
+                    "url": f"https://patents.google.com/?q={quote(q)}",
+                    "title": f"Google Patents: {q}",
+                    "note": "Deep link for exact-name/SMILES patent search — not an automated claim hit",
+                }
+            )
+
         return hits, checked, unavailable
 
     def evaluate(self, smiles: str) -> NoveltyEvidence:
@@ -118,73 +178,72 @@ class NoveltyService:
         providers_checked: List[str] = ["local_seed_library"]
         providers_unavailable: List[str] = []
 
-        # Exact match against seeds
-        seed_set = set(self.seed_smiles)
-        if can in seed_set:
+        if can in self.seed_smiles:
             ev = NoveltyEvidence(
                 status=NoveltyStatus.KNOWN,
                 score=0.0,
-                max_tanimoto_to_seeds=1.0,
+                max_tanimoto_to_seeds=None,
                 nearest_seed_smiles=can,
                 providers_checked=providers_checked,
-                notes=["Exact match in seed library"],
+                notes=["Exact SMILES match in seed library"],
             )
             self._cache[can] = ev
             return ev
 
-        max_sim, nearest = self._local_similarity(can)
-        key = inchikey_of(can)
+        identity = self.identity.resolve(can)
+        if identity.iupac_name:
+            notes.append(f"IUPAC: {identity.iupac_name}")
+        if identity.commercial_names:
+            notes.append(f"Names: {', '.join(identity.commercial_names[:3])}")
 
         lit_hits: List[dict] = []
-        if key:
-            pub_hits, pub_ok = self._query_pubchem(key)
-            if pub_ok:
-                providers_checked.append("pubchem")
-                lit_hits.extend(pub_hits)
-            else:
-                providers_unavailable.append("pubchem")
+        pub_hits, pub_ok = self._query_pubchem_exact(identity)
+        if pub_ok:
+            providers_checked.append("pubchem")
+            lit_hits.extend(pub_hits)
+            if pub_hits:
+                notes.append("Exact structure found in PubChem")
         else:
             providers_unavailable.append("pubchem")
 
-        oa_hits, oa_ok = self._query_openalex(can)
+        oa_hits, oa_ok = self._query_openalex(identity)
         if oa_ok:
             providers_checked.append("openalex")
             lit_hits.extend(oa_hits)
         else:
             providers_unavailable.append("openalex")
 
-        patent_hits, p_checked, p_unavail = self._query_patents(can)
+        patent_hits, p_checked, p_unavail = self._query_patents(identity)
         providers_checked.extend(p_checked)
         providers_unavailable.extend(p_unavail)
 
-        incomplete = bool(providers_unavailable) or ("lens" in providers_unavailable)
+        # Patent link_only does not count as a confirmed hit
+        confirmed_patents = [h for h in patent_hits if h.get("status") not in ("link_only", "not_queried")]
+        incomplete = bool(providers_unavailable)
 
-        if max_sim is not None and max_sim >= self.close_analogue_threshold:
-            status = NoveltyStatus.CLOSE_ANALOGUE
-            score = max(0.0, 1.0 - max_sim)
-            notes.append(f"Close analogue (Tanimoto={max_sim:.3f})")
-        elif lit_hits or patent_hits:
+        if lit_hits or confirmed_patents:
             status = NoveltyStatus.KNOWN
             score = 0.1
-            notes.append("External database hit")
+            notes.append("Exact-molecule literature/database hit via SMILES/IUPAC/commercial name")
         elif incomplete:
             status = NoveltyStatus.INCOMPLETE_SEARCH
-            score = max(0.0, 1.0 - (max_sim or 0.0)) * 0.5
+            score = 0.5
             notes.append(
                 "Some novelty providers unavailable — absence of hits is not proof of novelty."
             )
         else:
             status = NoveltyStatus.NO_MATCH_FOUND
-            score = max(0.0, 1.0 - (max_sim or 0.0))
+            score = 0.9
             notes.append(
-                "No match found in checked sources; not a legal novelty or patentability opinion."
+                "No exact-molecule match found for SMILES/IUPAC/commercial name in checked sources; "
+                "not a legal novelty or patentability opinion."
             )
 
         ev = NoveltyEvidence(
             status=status,
             score=score,
-            max_tanimoto_to_seeds=max_sim,
-            nearest_seed_smiles=nearest,
+            max_tanimoto_to_seeds=None,
+            nearest_seed_smiles=None,
             literature_hits=lit_hits,
             patent_hits=patent_hits,
             providers_checked=providers_checked,
