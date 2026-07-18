@@ -571,8 +571,9 @@ Directory: `ml/`
 
 `ml/data_gen/generate_pairs.py` applies SMARTS primitives to seed parents, validates children, predicts absolute properties with XGBoost, and stores:
 
-- parent/child SMILES, scaffold, reaction family, SMARTS  
-- Delta y_i = y_i^{child} - y_i^{parent} labeled `weak_xgb_delta`  
+- parent/child SMILES, scaffold, reaction family, SMARTS
+- `site_atom_indices` — parent atom indices that react (from RDKit `GetReactingAtoms` mapped through the reactant match; falls back to the full match)
+- Delta y_i = y_i^{child} - y_i^{parent} labeled `weak_xgb_delta`
 - scaffold-based train/val/test splits
 
 External measured reaction / hazard CSVs can be ingested via `ml/data_gen/ingest_external.py` when licensed data are available. Sensitivity / decomposition heads are **not** trained from SAScore proxies alone.
@@ -587,11 +588,19 @@ External measured reaction / hazard CSVs can be ingested via `ml/data_gen/ingest
 - `DeltaPropertyPredictor` — multi-task Δy regression
 - Optional `UncertaintyEnsemble` for epistemic spread
 
-Training entrypoint: `ml/training/train_planner.py` → checkpoint `ml/checkpoints/planner.pt`.
+Training entrypoint: `ml/training/train_planner.py` → checkpoint `ml/checkpoints/planner.pt` (family/reagent CE + reacting-site BCE + Δy MSE).
 
 ### 15.3 Online use
 
-If the checkpoint loads successfully, the modification mechanism may tag planner mode as `learned`; otherwise the rule-based strategy pool remains the production path.
+When `ml/checkpoints/planner.pt` loads:
+
+1. Encode parent graph + target−parent Δ vector with `ModificationPlanner`.
+2. Take top-k **reaction families** from the family head.
+3. Score atoms with the **site head** and prefer SMARTS matches that hit those atoms.
+4. Execute SMARTS via RDKit; optionally reorder children with `DeltaPropertyPredictor` (cosine alignment of predicted Δy to the target gap).
+5. Tag accepted children `planner="learned"`.
+
+If the checkpoint is missing/unloadable or too few valid children are produced, the rule-based strategy pool (and remaining primitives) fill the expansion. Beam search itself is unchanged: it still calls `ModificationMechanism.expand` per parent.
 
 ---
 

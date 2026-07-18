@@ -2,33 +2,72 @@
 
 from __future__ import annotations
 
-import math
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from rdkit import Chem
 
 
-ATOM_LIST = [1, 5, 6, 7, 8, 9, 15, 16, 17, 35, 53]
+ATOM_LIST = [1, 5, 6, 7, 8, 9, 14, 15, 16, 17, 35, 53]
+# H, B, C, N, O, F, Si, P, S, Cl, Br, I
+
+HYBRIDIZATION_LIST = [
+    Chem.rdchem.HybridizationType.SP,
+    Chem.rdchem.HybridizationType.SP2,
+    Chem.rdchem.HybridizationType.SP3,
+    Chem.rdchem.HybridizationType.SP3D,
+    Chem.rdchem.HybridizationType.SP3D2,
+]
+
+RING_SIZES = (3, 4, 5, 6, 7, 8)
+
+# element one-hot (+ unknown) + hybridization (+ other) + scalars + ring-size flags
+ATOM_FEAT_DIM = (
+    len(ATOM_LIST)
+    + 1
+    + len(HYBRIDIZATION_LIST)
+    + 1
+    + 12
+    + len(RING_SIZES)
+)
+
+
+def _atom_features(atom: Chem.Atom) -> List[float]:
+    z = atom.GetAtomicNum()
+    feats: List[float] = [1.0 if z == a else 0.0 for a in ATOM_LIST]
+    feats.append(0.0 if z in ATOM_LIST else 1.0)
+
+    hyb = atom.GetHybridization()
+    feats.extend(1.0 if hyb == h else 0.0 for h in HYBRIDIZATION_LIST)
+    feats.append(0.0 if hyb in HYBRIDIZATION_LIST else 1.0)
+
+    feats.extend(
+        [
+            float(atom.GetTotalDegree()),
+            float(atom.GetFormalCharge()),
+            float(atom.GetTotalValence()),
+            float(atom.GetValence(Chem.ValenceType.EXPLICIT)),
+            float(atom.GetValence(Chem.ValenceType.IMPLICIT)),
+            float(atom.GetTotalNumHs()),
+            float(atom.GetNumRadicalElectrons()),
+            float(atom.GetIsAromatic()),
+            float(atom.IsInRing()),
+            float(atom.GetChiralTag() != Chem.rdchem.ChiralType.CHI_UNSPECIFIED),
+            float(atom.GetMass()) / 100.0,
+            float(z) / 100.0,
+        ]
+    )
+    feats.extend(float(atom.IsInRingSize(s)) for s in RING_SIZES)
+    assert len(feats) == ATOM_FEAT_DIM
+    return feats
 
 
 def mol_to_graph(smiles: str) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
-    atom_feats = []
-    for atom in mol.GetAtoms():
-        z = atom.GetAtomicNum()
-        onehot = [1.0 if z == a else 0.0 for a in ATOM_LIST]
-        onehot += [
-            float(atom.GetTotalDegree()),
-            float(atom.GetFormalCharge()),
-            float(atom.GetIsAromatic()),
-            float(atom.IsInRing()),
-        ]
-        atom_feats.append(onehot)
+    atom_feats = [_atom_features(atom) for atom in mol.GetAtoms()]
     x = torch.tensor(atom_feats, dtype=torch.float32)
     edges = []
     for bond in mol.GetBonds():
@@ -43,7 +82,7 @@ def mol_to_graph(smiles: str) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
 
 
 class GraphTransformerEncoder(nn.Module):
-    def __init__(self, in_dim: int = len(ATOM_LIST) + 4, hidden: int = 128, layers: int = 3, heads: int = 4):
+    def __init__(self, in_dim: int = ATOM_FEAT_DIM, hidden: int = 128, layers: int = 3, heads: int = 4):
         super().__init__()
         self.input = nn.Linear(in_dim, hidden)
         layer = nn.TransformerEncoderLayer(
@@ -91,7 +130,7 @@ class ModificationPlanner(nn.Module):
         self.family_head = nn.Linear(hidden, n_families)
         self.site_head = nn.Linear(hidden, 1)  # applied per-atom via broadcast in training loop
         self.reagent_head = nn.Linear(hidden, n_reagents)
-        self.atom_proj = nn.Linear(len(ATOM_LIST) + 4, hidden)
+        self.atom_proj = nn.Linear(ATOM_FEAT_DIM, hidden)
 
     def encode(self, atom_x: torch.Tensor, delta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # atom_x: [1, N, F]
@@ -107,10 +146,11 @@ class ModificationPlanner(nn.Module):
         return self.reagent_head(z)
 
     def forward_sites(self, atom_x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        # returns [N] logits
-        atom_h = self.atom_proj(atom_x.squeeze(0))
-        scores = (atom_h * z).sum(dim=-1) / math.sqrt(atom_h.size(-1))
-        return scores
+        # returns [N] logits for reacting-site probability
+        atom_h = torch.relu(self.atom_proj(atom_x.squeeze(0)))
+        context = z.squeeze(0)
+        gated = atom_h * context
+        return self.site_head(gated).squeeze(-1)
 
 
 class DeltaPropertyPredictor(nn.Module):

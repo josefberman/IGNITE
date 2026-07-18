@@ -48,6 +48,7 @@ python -m ml.training.train_planner --epochs 3
 ```
 
 Checkpoints land in `ml/checkpoints/planner.pt` and are loaded automatically when present.
+Beam expansion then: top-k **families** from the Graph Transformer → site-biased SMARTS execution → optional Δy ranking → rule-based fill if short.
 
 ## API
 

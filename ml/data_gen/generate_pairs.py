@@ -30,6 +30,33 @@ def scaffold_of(smiles: str) -> str:
         return ""
 
 
+def reacting_atom_indices(mol: Chem.Mol, rxn, product_index: int) -> list[int]:
+    """Map RDKit reacting template atoms onto parent atom indices for one RunReactants hit."""
+    try:
+        tmpl = rxn.GetReactantTemplate(0)
+        if tmpl is None:
+            return []
+        matches = mol.GetSubstructMatches(tmpl)
+        if product_index >= len(matches):
+            return []
+        match = matches[product_index]
+        reacting = []
+        try:
+            reacting_sets = rxn.GetReactingAtoms()
+            if reacting_sets:
+                reacting = list(reacting_sets[0])
+        except Exception:
+            reacting = []
+        if reacting:
+            sites = sorted({int(match[j]) for j in reacting if j < len(match)})
+            if sites:
+                return sites
+        # Weak fallback: all atoms in the matched reactant pattern
+        return sorted({int(a) for a in match})
+    except Exception:
+        return []
+
+
 def generate(seed_csv: Path, models_dir: Path, out_dir: Path, max_parents: int = 500, max_per_parent: int = 5, seed: int = 42):
     out_dir.mkdir(parents=True, exist_ok=True)
     rng = random.Random(seed)
@@ -44,6 +71,7 @@ def generate(seed_csv: Path, models_dir: Path, out_dir: Path, max_parents: int =
     primitives = [p for p in list_primitives() if p["family_id"] != "identity"]
     rows = []
     failures = []
+    n_with_sites = 0
 
     for parent in smiles_list:
         parent_props = predictor.predict(parent)
@@ -64,7 +92,9 @@ def generate(seed_csv: Path, models_dir: Path, out_dir: Path, max_parents: int =
                     rxn = AllChem.ReactionFromSmarts(smarts)
                     if rxn is None:
                         continue
-                    for product_tuple in rxn.RunReactants((mol,)):
+                    product_sets = rxn.RunReactants((mol,))
+                    for pi, product_tuple in enumerate(product_sets):
+                        sites = reacting_atom_indices(mol, rxn, pi)
                         for product in product_tuple:
                             try:
                                 Chem.SanitizeMol(product)
@@ -83,12 +113,15 @@ def generate(seed_csv: Path, models_dir: Path, out_dir: Path, max_parents: int =
                             if not child_props:
                                 continue
                             safety = estimate_safety(child)
+                            if sites:
+                                n_with_sites += 1
                             row = {
                                 "parent_smiles": parent,
                                 "child_smiles": child,
                                 "scaffold": scaffold_of(parent),
                                 "reaction_family": prim["family_id"],
                                 "smarts": smarts,
+                                "site_atom_indices": json.dumps(sites),
                                 "edit_distance": edit_distance_proxy(parent, child),
                                 "label_type": "weak_xgb_delta",
                                 "safety_score": safety.score,
@@ -129,10 +162,11 @@ def generate(seed_csv: Path, models_dir: Path, out_dir: Path, max_parents: int =
 
     meta = {
         "n_pairs": len(out),
+        "n_with_site_labels": int(n_with_sites),
         "n_failures": len(failures),
         "max_parents": max_parents,
         "seed": seed,
-        "label_types": ["weak_xgb_delta"],
+        "label_types": ["weak_xgb_delta", "reacting_atom_sites"],
         "sha256": hashlib.sha256(csv_path.read_bytes()).hexdigest(),
         "license_note": "Synthetic weak labels from local SMARTS + XGBoost; not experimental ground truth.",
     }
