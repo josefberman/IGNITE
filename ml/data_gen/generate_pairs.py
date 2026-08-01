@@ -15,7 +15,7 @@ from rdkit.Chem.Scaffolds import MurckoScaffold
 
 from backend.app.services.chemistry import canonicalize, edit_distance_proxy, validate_molecule
 from backend.app.services.prediction import PropertyPredictor
-from backend.app.services.reaction_primitives import list_primitives
+from backend.app.services.reaction_primitives import list_primitives, reagent_id_for_smarts
 from backend.app.services.safety import estimate_safety
 from backend.app.domain.models import PROPERTY_KEYS
 
@@ -115,11 +115,15 @@ def generate(seed_csv: Path, models_dir: Path, out_dir: Path, max_parents: int =
                             safety = estimate_safety(child)
                             if sites:
                                 n_with_sites += 1
+                            reagent_id = reagent_id_for_smarts(prim["family_id"], smarts) or (
+                                f"{prim['family_id']}__v0"
+                            )
                             row = {
                                 "parent_smiles": parent,
                                 "child_smiles": child,
                                 "scaffold": scaffold_of(parent),
                                 "reaction_family": prim["family_id"],
+                                "reagent_id": reagent_id,
                                 "smarts": smarts,
                                 "site_atom_indices": json.dumps(sites),
                                 "edit_distance": edit_distance_proxy(parent, child),
@@ -166,7 +170,7 @@ def generate(seed_csv: Path, models_dir: Path, out_dir: Path, max_parents: int =
         "n_failures": len(failures),
         "max_parents": max_parents,
         "seed": seed,
-        "label_types": ["weak_xgb_delta", "reacting_atom_sites"],
+        "label_types": ["weak_xgb_delta", "reacting_atom_sites", "reagent_variant"],
         "sha256": hashlib.sha256(csv_path.read_bytes()).hexdigest(),
         "license_note": "Synthetic weak labels from local SMARTS + XGBoost; not experimental ground truth.",
     }

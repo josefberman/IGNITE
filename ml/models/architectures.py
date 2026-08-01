@@ -81,9 +81,20 @@ def mol_to_graph(smiles: str) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     return x, edge_index
 
 
+DEFAULT_HIDDEN = 32
+
+
 class GraphTransformerEncoder(nn.Module):
-    def __init__(self, in_dim: int = ATOM_FEAT_DIM, hidden: int = 128, layers: int = 3, heads: int = 4):
+    def __init__(
+        self,
+        in_dim: int = ATOM_FEAT_DIM,
+        hidden: int = DEFAULT_HIDDEN,
+        layers: int = 3,
+        heads: int = 4,
+    ):
         super().__init__()
+        if hidden % heads != 0:
+            raise ValueError(f"hidden ({hidden}) must be divisible by heads ({heads})")
         self.input = nn.Linear(in_dim, hidden)
         layer = nn.TransformerEncoderLayer(
             d_model=hidden, nhead=heads, dim_feedforward=hidden * 2, batch_first=True, dropout=0.1
@@ -105,7 +116,7 @@ class GraphTransformerEncoder(nn.Module):
 
 
 class TargetDeltaEncoder(nn.Module):
-    def __init__(self, in_dim: int = 4, hidden: int = 128):
+    def __init__(self, in_dim: int = 4, hidden: int = DEFAULT_HIDDEN):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
@@ -122,8 +133,9 @@ class TargetDeltaEncoder(nn.Module):
 class ModificationPlanner(nn.Module):
     """Hierarchical: family → site → reagent."""
 
-    def __init__(self, n_families: int, n_reagents: int, hidden: int = 128):
+    def __init__(self, n_families: int, n_reagents: int, hidden: int = DEFAULT_HIDDEN):
         super().__init__()
+        self.hidden = hidden
         self.parent_enc = GraphTransformerEncoder(hidden=hidden)
         self.delta_enc = TargetDeltaEncoder(hidden=hidden)
         self.fuse = nn.Sequential(nn.Linear(hidden * 2, hidden), nn.ReLU())
@@ -154,8 +166,9 @@ class ModificationPlanner(nn.Module):
 
 
 class DeltaPropertyPredictor(nn.Module):
-    def __init__(self, hidden: int = 128, out_dim: int = 4):
+    def __init__(self, hidden: int = DEFAULT_HIDDEN, out_dim: int = 4):
         super().__init__()
+        self.hidden = hidden
         self.parent_enc = GraphTransformerEncoder(hidden=hidden)
         self.child_enc = GraphTransformerEncoder(hidden=hidden)
         self.head = nn.Sequential(

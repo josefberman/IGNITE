@@ -35,7 +35,7 @@ Frontend:
 cd frontend && npm install && npm run dev
 ```
 
-Open http://localhost:5173 (Vite proxies `/api` → `http://127.0.0.1:8080`)
+Open [http://localhost:5173](http://localhost:5173) (Vite proxies `/api` → `http://127.0.0.1:8080`)
 
 ## Training the learned modification stack
 
@@ -48,21 +48,23 @@ python -m ml.training.train_planner --epochs 3
 ```
 
 Checkpoints land in `ml/checkpoints/planner.pt` and are loaded automatically when present.
-Beam expansion then: top-k **families** from the Graph Transformer → site-biased SMARTS execution → optional Δy ranking → rule-based fill if short.
+Beam expansion then: top-k **families** → family-masked **reagent** (SMARTS variant) ranking → site-biased execution → optional Δy ranking → rule-based fill if short.
 
 ## API
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET | `/api/v1/health` | Health |
-| GET | `/api/v1/models` | Model metadata |
-| POST | `/api/v1/search` | Start search |
-| GET | `/api/v1/search/{id}/progress` | Progress |
-| GET | `/api/v1/search/{id}/events` | SSE progress |
-| GET | `/api/v1/search/{id}` | Result |
-| POST | `/api/v1/search/{id}/cancel` | Cancel |
-| GET | `/api/v1/search/{id}/export.csv` | CSV export |
-| GET | `/api/v1/search/{id}/export.sdf` | SDF export |
+
+| Method | Path                             | Purpose        |
+| ------ | -------------------------------- | -------------- |
+| GET    | `/api/v1/health`                 | Health         |
+| GET    | `/api/v1/models`                 | Model metadata |
+| POST   | `/api/v1/search`                 | Start search   |
+| GET    | `/api/v1/search/{id}/progress`   | Progress       |
+| GET    | `/api/v1/search/{id}/events`     | SSE progress   |
+| GET    | `/api/v1/search/{id}`            | Result         |
+| POST   | `/api/v1/search/{id}/cancel`     | Cancel         |
+| GET    | `/api/v1/search/{id}/export.csv` | CSV export     |
+| GET    | `/api/v1/search/{id}/export.sdf` | SDF export     |
+
 
 ## Docker
 

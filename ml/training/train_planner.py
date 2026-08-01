@@ -12,8 +12,9 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from backend.app.services.reaction_primitives import list_primitives
+from backend.app.services.reaction_primitives import list_primitives, list_reagents
 from ml.models.architectures import (
+    DEFAULT_HIDDEN,
     DeltaPropertyPredictor,
     ModificationPlanner,
     mol_to_graph,
@@ -36,9 +37,16 @@ def _parse_sites(raw) -> list[int]:
 
 
 class PairDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, family_to_idx: dict, split: str):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        family_to_idx: dict,
+        reagent_to_idx: dict,
+        split: str,
+    ):
         self.df = df[df["split"] == split].reset_index(drop=True)
         self.family_to_idx = family_to_idx
+        self.reagent_to_idx = reagent_to_idx
 
     def __len__(self):
         return len(self.df)
@@ -52,6 +60,11 @@ class PairDataset(Dataset):
         px, _ = parent
         cx, _ = child
         fam = self.family_to_idx.get(row["reaction_family"], 0)
+        reagent_id = row["reagent_id"] if "reagent_id" in row.index and pd.notna(row["reagent_id"]) else None
+        if reagent_id is None:
+            # Legacy CSV: synthesize from family + smarts position when possible
+            reagent_id = f"{row['reaction_family']}__v0"
+        reag = self.reagent_to_idx.get(str(reagent_id), 0)
         delta = torch.tensor(
             [
                 row["delta_density"],
@@ -66,19 +79,16 @@ class PairDataset(Dataset):
         for a in sites:
             if 0 <= a < site_target.numel():
                 site_target[a] = 1.0
-        return px, cx, fam, delta, delta.clone(), site_target
+        return px, cx, fam, reag, delta, delta.clone(), site_target
 
 
 def collate(batch):
-    # variable atom counts — process one-by-one in training loop for simplicity
     return batch
 
 
 def _site_loss(site_logits: torch.Tensor, site_target: torch.Tensor) -> torch.Tensor:
     if site_target.sum() <= 0:
-        # No labeled sites: do not push logits; small L2 to keep finite
         return 0.01 * (site_logits ** 2).mean()
-    # Positive atoms are rare — weight positives higher
     pos = float(site_target.sum().item())
     neg = float(site_target.numel() - pos)
     pos_weight = torch.tensor([max(1.0, neg / max(pos, 1.0))], dtype=torch.float32)
@@ -93,17 +103,26 @@ def train(data_csv: Path, out_dir: Path, epochs: int = 5, batch_size: int = 8, l
             "Dataset missing site_atom_indices; re-run ml.data_gen.generate_pairs before training"
         )
     families = [p["family_id"] for p in list_primitives() if p["family_id"] != "identity"]
+    reagents = [r["reagent_id"] for r in list_reagents()]
     family_to_idx = {f: i for i, f in enumerate(families)}
-    reagents = families  # reagent vocab aligned to family for bootstrap
+    reagent_to_idx = {r: i for i, r in enumerate(reagents)}
 
-    train_ds = PairDataset(df, family_to_idx, "train")
-    val_ds = PairDataset(df, family_to_idx, "val")
+    # Family → allowed reagent indices (chemistry mask for val metrics / logging)
+    family_to_reagent_idxs = {f: [] for f in families}
+    for r in list_reagents():
+        family_to_reagent_idxs[r["family_id"]].append(reagent_to_idx[r["reagent_id"]])
+
+    train_ds = PairDataset(df, family_to_idx, reagent_to_idx, "train")
+    val_ds = PairDataset(df, family_to_idx, reagent_to_idx, "val")
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate)
 
-    planner = ModificationPlanner(n_families=len(families), n_reagents=len(reagents))
-    delta_model = DeltaPropertyPredictor()
+    planner = ModificationPlanner(
+        n_families=len(families), n_reagents=len(reagents), hidden=DEFAULT_HIDDEN
+    )
+    delta_model = DeltaPropertyPredictor(hidden=DEFAULT_HIDDEN)
     opt = torch.optim.Adam(list(planner.parameters()) + list(delta_model.parameters()), lr=lr)
+    scale = torch.tensor([1.0, 1000.0, 10.0, 100.0], dtype=torch.float32)
 
     history = []
     for epoch in range(epochs):
@@ -112,7 +131,7 @@ def train(data_csv: Path, out_dir: Path, epochs: int = 5, batch_size: int = 8, l
         total_loss = 0.0
         n = 0
         for batch in train_loader:
-            for px, cx, fam, delta, target_delta, site_target in batch:
+            for px, cx, fam, reag, delta, target_delta, site_target in batch:
                 opt.zero_grad()
                 px_b = px.unsqueeze(0)
                 cx_b = cx.unsqueeze(0)
@@ -121,11 +140,9 @@ def train(data_csv: Path, out_dir: Path, epochs: int = 5, batch_size: int = 8, l
                 reag_logits = planner.forward_reagent(z)
                 site_logits = planner.forward_sites(px_b, z)
                 loss_fam = F.cross_entropy(fam_logits, torch.tensor([fam]))
-                loss_reag = F.cross_entropy(reag_logits, torch.tensor([fam]))
+                loss_reag = F.cross_entropy(reag_logits, torch.tensor([reag]))
                 loss_site = _site_loss(site_logits, site_target)
                 pred_delta = delta_model(px_b, cx_b)
-                # Scale property deltas so MSE does not drown family/site losses
-                scale = torch.tensor([1.0, 1000.0, 10.0, 100.0], dtype=torch.float32)
                 loss_delta = F.mse_loss(pred_delta.squeeze(0) / scale, delta / scale)
                 loss = loss_fam + loss_reag + 2.0 * loss_site + loss_delta
                 loss.backward()
@@ -137,21 +154,22 @@ def train(data_csv: Path, out_dir: Path, epochs: int = 5, batch_size: int = 8, l
         planner.eval()
         delta_model.eval()
         val_loss = 0.0
-        site_hits = 0
-        site_total = 0
+        site_hits = site_total = 0
+        reag_hits = reag_total = 0
         vn = 0
         with torch.no_grad():
             for batch in val_loader:
-                for px, cx, fam, delta, target_delta, site_target in batch:
+                for px, cx, fam, reag, delta, target_delta, site_target in batch:
                     px_b = px.unsqueeze(0)
                     cx_b = cx.unsqueeze(0)
                     z, _ = planner.encode(px_b, target_delta.unsqueeze(0))
                     fam_logits = planner.forward_family(z)
+                    reag_logits = planner.forward_reagent(z)
                     site_logits = planner.forward_sites(px_b, z)
                     pred_delta = delta_model(px_b, cx_b)
-                    scale = torch.tensor([1.0, 1000.0, 10.0, 100.0], dtype=torch.float32)
                     loss = (
                         F.cross_entropy(fam_logits, torch.tensor([fam]))
+                        + F.cross_entropy(reag_logits, torch.tensor([reag]))
                         + F.mse_loss(pred_delta.squeeze(0) / scale, delta / scale)
                         + 2.0 * _site_loss(site_logits, site_target)
                     )
@@ -159,37 +177,58 @@ def train(data_csv: Path, out_dir: Path, epochs: int = 5, batch_size: int = 8, l
                     vn += 1
                     if site_target.sum() > 0:
                         site_total += 1
-                        pred_idx = int(site_logits.argmax().item())
-                        if site_target[pred_idx] > 0.5:
+                        if site_target[int(site_logits.argmax().item())] > 0.5:
                             site_hits += 1
+                    # Family-masked reagent top-1
+                    allowed = family_to_reagent_idxs.get(families[fam], [])
+                    if allowed:
+                        reag_total += 1
+                        masked = reag_logits.squeeze(0).clone()
+                        ban = torch.ones_like(masked, dtype=torch.bool)
+                        ban[allowed] = False
+                        masked[ban] = -1e9
+                        if int(masked.argmax().item()) == reag:
+                            reag_hits += 1
         vavg = val_loss / max(1, vn)
         site_acc = site_hits / max(1, site_total)
+        reag_acc = reag_hits / max(1, reag_total)
         history.append(
             {
                 "epoch": epoch + 1,
                 "train_loss": avg,
                 "val_loss": vavg,
                 "val_site_top1_acc": site_acc,
+                "val_reagent_masked_top1_acc": reag_acc,
             }
         )
         print(
-            f"epoch {epoch+1}: train={avg:.4f} val={vavg:.4f} site_top1={site_acc:.3f}"
+            f"epoch {epoch+1}: train={avg:.4f} val={vavg:.4f} "
+            f"site_top1={site_acc:.3f} reag_top1={reag_acc:.3f}"
         )
 
     bundle = {
         "families": families,
         "reagents": reagents,
+        "family_to_reagent_idxs": family_to_reagent_idxs,
         "history": history,
         "site_supervision": True,
+        "reagent_supervision": True,
+        "hidden": DEFAULT_HIDDEN,
         "delta_scale": [1.0, 1000.0, 10.0, 100.0],
     }
-    torch.save({"planner": planner.state_dict(), "delta": delta_model.state_dict(), "meta": bundle}, out_dir / "planner.pt")
+    torch.save(
+        {"planner": planner.state_dict(), "delta": delta_model.state_dict(), "meta": bundle},
+        out_dir / "planner.pt",
+    )
     (out_dir / "model_card.json").write_text(
         json.dumps(
             {
                 "name": "ignite_modification_planner",
-                "version": "0.2.0",
-                "label_type": "weak_xgb_delta+reacting_atom_sites",
+                "version": "0.3.1",
+                "label_type": "weak_xgb_delta+reacting_atom_sites+reagent_variant",
+                "hidden": DEFAULT_HIDDEN,
+                "n_families": len(families),
+                "n_reagents": len(reagents),
                 "families": families,
                 "history": history,
                 "disclaimer": "Trained on synthetic weak labels; not experimental ground truth.",

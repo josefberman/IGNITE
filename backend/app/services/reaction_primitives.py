@@ -623,16 +623,49 @@ def list_primitives() -> List[dict]:
     """Export primitive metadata for training / learned planner vocab."""
     out = []
     for name, variants, delta, desc in _PRIMITIVE_ROWS:
+        smarts_list = [s for s, _src in variants if s]
+        reagent_ids = [f"{name}__v{i}" for i in range(len(smarts_list))]
         out.append(
             {
                 "family_id": name,
                 "delta": delta,
                 "description": desc,
-                "smarts_variants": [s for s, _src in variants if s],
+                "smarts_variants": smarts_list,
+                "reagent_ids": reagent_ids,
                 "sources": [src for _s, src in variants],
             }
         )
     return out
+
+
+def list_reagents() -> List[dict]:
+    """Flat SMARTS-variant reagent vocabulary (stable IDs for the reagent head)."""
+    out: List[dict] = []
+    for prim in list_primitives():
+        if prim["family_id"] == "identity":
+            continue
+        for i, (smarts, rid) in enumerate(zip(prim["smarts_variants"], prim["reagent_ids"])):
+            out.append(
+                {
+                    "reagent_id": rid,
+                    "family_id": prim["family_id"],
+                    "smarts": smarts,
+                    "variant_index": i,
+                    "source": (prim.get("sources") or [""])[i] if i < len(prim.get("sources") or []) else "",
+                }
+            )
+    return out
+
+
+def reagent_id_for_smarts(family_id: str, smarts: str) -> Optional[str]:
+    """Resolve a SMARTS string to its reagent_id within a family."""
+    for prim in list_primitives():
+        if prim["family_id"] != family_id:
+            continue
+        for rid, s in zip(prim["reagent_ids"], prim["smarts_variants"]):
+            if s == smarts:
+                return rid
+    return None
 
 
 def get_modification_strategies(smiles: str, property_gap: Dict[str, float],
