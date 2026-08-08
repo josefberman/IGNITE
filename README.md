@@ -79,6 +79,10 @@ docker compose -f infra/docker-compose.yml up --build
 - OpenAlex literature metadata (optional network)
 - Lens / EPO OPS require API keys; without keys status is `incomplete_search`, never “novel”
 
-## License / data notes
+## License
 
-Seed CSV and XGBoost models are project assets. Synthetic modification pairs are weak labels derived from SMARTS + model predictions — mark measured experimental labels separately when ingested.
+Code and project documentation are licensed under the [Apache License 2.0](LICENCE.md) (see also [NOTICE](NOTICE)).
+
+This repository is **research software in progress**. Public release supports open science and reproducibility; it is not a substitute for peer-reviewed journal publication of associated manuscripts. Most chemistry / ML venues accept prior public code and preprints — confirm the target journal’s preprint / prior-disclosure policy before submission.
+
+Data and trained artifacts: seed CSV and XGBoost models are project assets (see [docs/LICENSING.md](docs/LICENSING.md)). Synthetic modification pairs are weak labels derived from SMARTS + model predictions — mark measured experimental labels separately when ingested.

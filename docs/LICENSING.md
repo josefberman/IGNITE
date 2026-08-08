@@ -1,4 +1,10 @@
-# Dataset and model licensing notes
+# Licensing notes
+
+## Source code and documentation
+
+- License: [Apache License 2.0](../LICENCE.md)
+- Copyright: see [NOTICE](../NOTICE)
+- Status: research software in progress; public GitHub release is for open science / reproducibility and is separate from peer-reviewed publication of papers.
 
 ## Seed library
 

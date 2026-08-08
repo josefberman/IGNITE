@@ -28,132 +28,372 @@ const DEFAULT_BEAM: BeamParameters = {
   early_stop_on_mape: false,
 };
 
-function StructureImage({ smiles, size = 220 }: { smiles: string; size?: number }) {
-  const src = `/api/v1/molecule/depict?smiles=${encodeURIComponent(smiles)}&size=${size}`;
+const PROPERTY_CHANNELS = [
+  {
+    key: "density" as const,
+    label: "ρ",
+    name: "Density",
+    unit: "g·cm⁻³",
+    title: "Crystal bulk density",
+    shortUnit: "g/cm³",
+  },
+  {
+    key: "det_velocity" as const,
+    label: "D",
+    name: "Det. velocity",
+    unit: "m·s⁻¹",
+    title: "Chapman–Jouguet detonation velocity",
+    shortUnit: "m/s",
+  },
+  {
+    key: "det_pressure" as const,
+    label: "P",
+    name: "Det. pressure",
+    unit: "GPa",
+    title: "CJ detonation pressure",
+    shortUnit: "GPa",
+  },
+  {
+    key: "hf_solid" as const,
+    label: "ΔHf",
+    name: "Heat of formation",
+    unit: "kJ·mol⁻¹",
+    title: "Solid-phase standard enthalpy of formation",
+    shortUnit: "kJ/mol",
+  },
+] as const;
+
+const PROPERTY_LABELS: Record<keyof TargetProperties, string> = {
+  density: "Density",
+  det_velocity: "Detonation velocity",
+  det_pressure: "Detonation pressure",
+  hf_solid: "Heat of formation (solid)",
+};
+
+const PROPERTY_UNITS: Record<keyof TargetProperties, string> = {
+  density: "g·cm⁻³",
+  det_velocity: "m·s⁻¹",
+  det_pressure: "GPa",
+  hf_solid: "kJ·mol⁻¹",
+};
+
+function formatTargetValue(key: keyof TargetProperties, value: number): string {
+  if (key === "density") return value.toFixed(2);
+  if (key === "det_pressure") return value.toFixed(1);
+  return String(Math.round(value));
+}
+
+function AppHeader() {
   return (
-    <div className="structure">
-      <img src={src} alt={`2D structure for ${smiles}`} width={size} height={size} loading="lazy" />
-    </div>
+    <header className="app-header">
+      <div className="wordmark">
+        <span className="wordmark-symbol" aria-hidden>⌬</span>
+        <span>IGNITE</span>
+      </div>
+      <div className="header-context">
+        <span>Energetic molecular design</span>
+        <span className="header-rule" />
+        <span>Workspace 01</span>
+      </div>
+      <span className="preview-label">Research preview</span>
+    </header>
   );
 }
 
-function ScoringGuide() {
+function TargetProfile({ targets }: { targets: TargetProperties }) {
   return (
-    <section className="card scoring-guide">
-      <h2>How candidate scoring works</h2>
-      <p>
-        After each beam iteration, every valid molecule receives a <strong>total score</strong> (lower is better).
-        Candidates are ranked by this total; the top <em>K</em> survive to the next iteration, and the lowest-scoring
-        molecule is returned as the best result.
-      </p>
-
-      <h3>1. Property MAPE (weight 0.65)</h3>
-      <p>
-        Mean Absolute Percentage Error across density, detonation velocity, detonation pressure, and Hf solid
-        (equal weights 0.25 each):
-      </p>
-      <pre>MAPE% = average_i( |pred_i − target_i| / |target_i| × 100 )</pre>
-      <p>
-        For ranking this is normalized to <code>mape_normalized = min(MAPE% / 100, 1)</code> so 0% error → 0 and
-        ≥100% error → 1.
-      </p>
-
-      <h3>2. Synthetic accessibility / SAScore penalty (weight 0.25)</h3>
-      <p>
-        RDKit SAScore (≈1 easy … 10 hard) is mapped to [0, 1]. Lower values mean easier synthesis and contribute less
-        penalty.
-      </p>
-
-      <h3>3. Minimal-edit penalty (weight 0.10)</h3>
-      <p>
-        Prefers simpler modifications: <code>edit = min(1, atom_count_delta / 10)</code>. Seeds (no edit) score 0 here.
-      </p>
-
-      <h3>Combined total (lower is better)</h3>
-      <pre>
-{`total =
-  0.65 × mape_normalized
-+ 0.25 × sascore_penalty
-+ 0.10 × minimal_edit_penalty`}
-      </pre>
-      <p>
-        During search (while best MAPE is above the threshold), an explore mode temporarily raises the MAPE weight
-        and lightly penalizes unedited dataset seeds so generated children can enter the beam. Final displayed
-        rankings use the weights above. Optional novelty gate (user input) can hard-reject known molecules
-        without changing the ranking formula.
-      </p>
+    <section className="objective" aria-label="Target property profile">
+      <div className="objective-heading">
+        <p className="eyebrow">Objective vector</p>
+        <p>Four target properties define the search direction.</p>
+      </div>
+      <div className="objective-vector">
+        {PROPERTY_CHANNELS.map((ch, index) => (
+          <div className="objective-value" key={ch.key} title={ch.title}>
+            <div className="objective-index">{String(index + 1).padStart(2, "0")}</div>
+            <div>
+              <div className="objective-symbol">{ch.label}</div>
+              <div className="objective-number">
+                {formatTargetValue(ch.key, targets[ch.key])}
+                <span>{ch.shortUnit}</span>
+              </div>
+              <div className="objective-name">{ch.name}</div>
+            </div>
+          </div>
+        ))}
+      </div>
     </section>
   );
 }
 
-function plannerBadge(planner?: string, generation?: number): string | null {
-  if (generation === 0) return "Seed";
-  if (planner === "learned") return "Learned planner";
-  if (planner === "rule_based") return "Rule-based";
+function ScoringReference() {
+  return (
+    <details className="method-note">
+      <summary>Scoring methodology</summary>
+      <div className="method-content">
+        <p>
+          Each valid structure receives a total score (lower is better). The beam keeps the top K survivors
+          each iteration; the lowest total is returned as the best candidate.
+        </p>
+        <h3>Property MAPE — weight 0.65</h3>
+        <p>Mean absolute percentage error across all four targets (equal weights 0.25 each).</p>
+        <pre>MAPE% = average_i( |pred_i − target_i| / |target_i| × 100 )</pre>
+        <h3>Synthetic accessibility — weight 0.25</h3>
+        <p>RDKit SAScore mapped to [0, 1]. Lower synthesis difficulty means less penalty.</p>
+        <h3>Minimal edit — weight 0.10</h3>
+        <p>
+          Prefers simpler modifications: <code>edit = min(1, atom_count_delta / 10)</code>
+        </p>
+        <h3>Combined total</h3>
+        <pre>
+          {`total = 0.65 × mape_norm + 0.25 × sascore + 0.10 × edit`}
+        </pre>
+      </div>
+    </details>
+  );
+}
+
+function NumberField({
+  id,
+  label,
+  unit,
+  hint,
+  value,
+  step,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  unit: string;
+  hint?: string;
+  value: number;
+  step?: string;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div className="control">
+      <label htmlFor={id}>{label}</label>
+      {hint ? <span className="control-hint">{hint}</span> : null}
+      <div className="control-input">
+        <input
+          id={id}
+          type="number"
+          step={step}
+          value={value}
+          onChange={(e) => onChange(+e.target.value)}
+        />
+        <span className="input-unit">{unit}</span>
+      </div>
+    </div>
+  );
+}
+
+function ToggleField({
+  checked,
+  onChange,
+  label,
+  description,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  label: string;
+  description: string;
+}) {
+  return (
+    <label className="option">
+      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+      <span className="option-switch" aria-hidden />
+      <span className="option-copy">
+        <span className="option-label">{label}</span>
+        <span className="option-description">{description}</span>
+      </span>
+    </label>
+  );
+}
+
+function StructureImage({ smiles, size = 200 }: { smiles: string; size?: number }) {
+  const src = `/api/v1/molecule/depict?smiles=${encodeURIComponent(smiles)}&size=${size}`;
+  return (
+    <div className="molecule-figure">
+      <img src={src} alt="" width={size} height={size} loading="lazy" />
+    </div>
+  );
+}
+
+function plannerBadge(planner?: string, generation?: number): { label: string; cls: string } | null {
+  if (generation === 0) return { label: "Seed", cls: "tag tag--seed" };
+  if (planner === "learned") return { label: "Learned", cls: "tag tag--learned" };
+  if (planner === "rule_based") return { label: "Rule-based", cls: "tag" };
   return null;
 }
 
-function MoleculeCard({ title, mol }: { title: string; mol: CandidateMolecule }) {
+function MoleculeCard({
+  title,
+  mol,
+  rank,
+  featured,
+}: {
+  title: string;
+  mol: CandidateMolecule;
+  rank?: number;
+  featured?: boolean;
+}) {
   const props = mol.properties || {};
+  const badge = plannerBadge(mol.modification?.planner, mol.generation);
+
   return (
-    <div className="mol">
-      <h3>{title}</h3>
-      <div className="mol-layout">
+    <article className={`candidate${featured ? " candidate--featured" : ""}`}>
+      <header className="candidate-heading">
+        <div>
+          <span className="candidate-rank">{rank != null ? `Candidate ${String(rank).padStart(2, "0")}` : "Search result"}</span>
+          <h3>{title}</h3>
+        </div>
+        <div className="candidate-summary">
+          <span><small>MAPE</small>{mol.mape?.toFixed(2)}%</span>
+          {mol.score && <span><small>Score</small>{mol.score.total.toFixed(3)}</span>}
+          {badge && <span className={badge.cls}>{badge.label}</span>}
+        </div>
+      </header>
+      <div className="candidate-content">
         <StructureImage smiles={mol.canonical_smiles} />
-        <div className="mol-meta">
-          <div><code>{mol.canonical_smiles}</code></div>
-          {mol.inchikey ? <div className="progress">InChIKey: {mol.inchikey}</div> : null}
-          <div className="badges">
-            <span>MAPE {mol.mape?.toFixed(2)}%</span>
-            {mol.score && <span>Score {mol.score.total.toFixed(3)}</span>}
-            {mol.modification && <span>{mol.modification.reaction_family}</span>}
-            {plannerBadge(mol.modification?.planner, mol.generation) && (
-              <span className={mol.modification?.planner === "learned" ? "badge-learned" : mol.generation === 0 ? "" : "badge-rule"}>
-                {plannerBadge(mol.modification?.planner, mol.generation)}
-              </span>
-            )}
-            <span>gen {mol.generation}</span>
-            {Object.values(props)[0] && <span>source {Object.values(props)[0].source}</span>}
+        <div className="candidate-data">
+          <code className="smiles">{mol.canonical_smiles}</code>
+          {mol.inchikey ? <p className="meta">InChIKey · {mol.inchikey}</p> : null}
+          <div className="tag-row">
+            {mol.modification && <span className="tag">{mol.modification.reaction_family}</span>}
+            <span className="tag">Generation {mol.generation}</span>
+            {Object.values(props)[0] && <span className="tag">{Object.values(props)[0].source}</span>}
           </div>
+          <div className="property-table-wrap">
+            <table className="property-table">
+              <thead>
+                <tr>
+                  <th>Property</th>
+                  <th>Estimate</th>
+                  <th>Source</th>
+                </tr>
+              </thead>
+              <tbody>
+                {Object.entries(props).map(([k, v]) => (
+                  <tr key={k}>
+                    <td>{PROPERTY_LABELS[k as keyof TargetProperties] ?? k.replace(/_/g, " ")}</td>
+                    <td className="numeric">{v.value.toFixed(3)}</td>
+                    <td>{v.source}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {mol.score && (
+            <p className="score-detail">
+              MAPE {mol.score.mape.toFixed(2)}% · SA {mol.score.sascore_penalty.toFixed(3)} · edit{" "}
+              {mol.score.minimal_edit_penalty.toFixed(3)} · <strong>total {mol.score.total.toFixed(3)}</strong>
+            </p>
+          )}
         </div>
       </div>
-      <table>
-        <thead>
-          <tr><th>Property</th><th>Value</th><th>Source</th></tr>
-        </thead>
-        <tbody>
-          {Object.entries(props).map(([k, v]) => (
-            <tr key={k}>
-              <td>{k}</td>
-              <td>{v.value.toFixed(3)}</td>
-              <td>{v.source}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      {mol.score && (
-        <div className="score-breakdown progress">
-          <div>Score breakdown (lower better)</div>
-          <div>
-            MAPE {mol.score.mape.toFixed(2)}% (norm {mol.score.mape_normalized.toFixed(3)}) ·
-            SA {mol.score.sascore_penalty.toFixed(3)} ·
-            edit {mol.score.minimal_edit_penalty.toFixed(3)} ·
-            <strong> total {mol.score.total.toFixed(3)}</strong>
+      {mol.lineage?.length ? (
+        <footer className="lineage">
+          <p className="eyebrow">Modification lineage</p>
+          <div className="lineage-strip">
+            {mol.lineage.map((s) => (
+              <StructureImage key={s} smiles={s} size={96} />
+            ))}
+            <StructureImage smiles={mol.canonical_smiles} size={96} />
           </div>
+        </footer>
+      ) : null}
+    </article>
+  );
+}
+
+function statusClass(status: string): string {
+  if (status === "running" || status === "queued") return "run-status run-status--active";
+  if (status === "completed") return "run-status run-status--done";
+  if (status === "failed" || status === "cancelled") return "run-status run-status--error";
+  return "run-status";
+}
+
+function RunMonitor({
+  progress,
+  result,
+}: {
+  progress: SearchProgress | null;
+  result: SearchResult | null;
+}) {
+  if (!progress) {
+    return (
+      <div className="search-empty">
+        <div className="empty-orbit" aria-hidden>
+          <span /><span /><span />
+        </div>
+        <p className="eyebrow">Search trajectory</p>
+        <h2>Ready to explore molecular space.</h2>
+        <p>Set the experiment brief, then start the search. Accepted transformations and beam decisions will appear here.</p>
+      </div>
+    );
+  }
+
+  const pct =
+    progress.max_iterations > 0
+      ? Math.min(100, (progress.iteration / progress.max_iterations) * 100)
+      : 0;
+
+  return (
+    <div className="run-monitor">
+      <div className="run-heading">
+        <span className={statusClass(progress.status)}>{progress.status}</span>
+        <span className="run-id">Run {progress.job_id.slice(0, 8)}</span>
+      </div>
+
+      <div className="iteration-progress">
+        <div className="iteration-label">
+          <span>Beam iterations</span>
+          <span className="numeric">
+            {progress.iteration} / {progress.max_iterations}
+          </span>
+        </div>
+        <div
+          className="iteration-track"
+          role="progressbar"
+          aria-valuenow={progress.iteration}
+          aria-valuemin={0}
+          aria-valuemax={progress.max_iterations}
+        >
+          <div className="iteration-fill" style={{ width: `${pct}%` }} />
+        </div>
+      </div>
+
+      <dl className="run-metrics">
+        <div>
+          <dt>Beam size</dt>
+          <dd>{progress.beam_size}</dd>
+        </div>
+        <div>
+          <dt>Generated</dt>
+          <dd>{progress.candidates_generated}</dd>
+        </div>
+        <div>
+          <dt>Rejected</dt>
+          <dd>{progress.rejected_count}</dd>
+        </div>
+        <div className="metric-accent">
+          <dt>Best MAPE</dt>
+          <dd>{progress.best_mape?.toFixed(2) ?? "—"}%</dd>
+        </div>
+        <div>
+          <dt>Best score</dt>
+          <dd>{progress.best_score?.toFixed(4) ?? "—"}</dd>
+        </div>
+      </dl>
+
+      {progress.message ? <p className="run-log">{progress.message}</p> : null}
+
+      {result?.best && (
+        <div className="run-result">
+          <MoleculeCard title="Best candidate" mol={result.best} featured />
         </div>
       )}
-      {mol.lineage?.length ? (
-        <div className="lineage">
-          <p className="progress">Modification lineage</p>
-          <div className="lineage-row">
-            {mol.lineage.map((s) => (
-              <StructureImage key={s} smiles={s} size={120} />
-            ))}
-            <StructureImage smiles={mol.canonical_smiles} size={120} />
-          </div>
-          <p className="progress">{[...mol.lineage, mol.canonical_smiles].join(" → ")}</p>
-        </div>
-      ) : null}
     </div>
   );
 }
@@ -181,8 +421,8 @@ export default function App() {
           setResult(r);
           setRunning(false);
         }
-      } catch (e: any) {
-        setError(String(e.message || e));
+      } catch (e: unknown) {
+        setError(String((e as Error).message || e));
         setRunning(false);
       }
     }, 800);
@@ -198,8 +438,8 @@ export default function App() {
       const p = await createSearch({ targets, beam });
       setJobId(p.job_id);
       setProgress(p);
-    } catch (e: any) {
-      setError(String(e.message || e));
+    } catch (e: unknown) {
+      setError(String((e as Error).message || e));
       setRunning(false);
     }
   };
@@ -212,115 +452,166 @@ export default function App() {
   const exportHref = useMemo(() => (jobId ? `/api/v1/search/${jobId}/export.csv` : "#"), [jobId]);
 
   return (
-    <div className="app">
-      <header>
-        <h1>IGNITE</h1>
-        <p>Intelligent Generation and Navigation through Iterative Transformations of Energetics</p>
-      </header>
+    <>
+      <AppHeader />
+      <main className="workstation">
+        <aside className="brief">
+          <header className="brief-heading">
+            <p className="eyebrow">Experiment brief</p>
+            <h1>Define the search.</h1>
+            <p>Specify the desired energetic profile and the bounds of molecular exploration.</p>
+          </header>
 
-      <ScoringGuide />
+          <section className="brief-section">
+            <div className="brief-section-heading">
+              <span>01</span>
+              <h2>Target properties</h2>
+            </div>
+            <div className="controls-grid">
+                {(Object.keys(PROPERTY_LABELS) as (keyof TargetProperties)[]).map((key) => (
+                  <NumberField
+                    key={key}
+                    id={key}
+                    label={PROPERTY_LABELS[key]}
+                    unit={PROPERTY_UNITS[key]}
+                    value={targets[key]}
+                    step={key === "density" ? "0.01" : key === "det_pressure" ? "0.1" : undefined}
+                    onChange={(v) => setT(key, v)}
+                  />
+                ))}
+            </div>
+          </section>
 
-      <div className="grid">
-        <section className="card">
-          <h2>Target properties</h2>
-          <div className="row">
-            <div>
-              <label>Density (g/cm³)</label>
-              <input type="number" step="0.01" value={targets.density} onChange={(e) => setT("density", +e.target.value)} />
+          <section className="brief-section">
+            <div className="brief-section-heading">
+              <span>02</span>
+              <h2>Search bounds</h2>
             </div>
-            <div>
-              <label>Detonation velocity (m/s)</label>
-              <input type="number" value={targets.det_velocity} onChange={(e) => setT("det_velocity", +e.target.value)} />
+            <div className="controls-grid">
+                <NumberField
+                  id="depth"
+                  label="Depth"
+                  unit="iterations"
+                  hint="Number of expansion rounds"
+                  value={beam.depth}
+                  onChange={(v) => setB("depth", v)}
+                />
+                <NumberField
+                  id="width"
+                  label="Width"
+                  unit="per node"
+                  hint="Children generated per parent"
+                  value={beam.width}
+                  onChange={(v) => setB("width", v)}
+                />
+                <NumberField
+                  id="top_k"
+                  label="Top K"
+                  unit="survivors"
+                  hint="Candidates kept each round"
+                  value={beam.top_k}
+                  onChange={(v) => setB("top_k", v)}
+                />
+                <NumberField
+                  id="mape_threshold"
+                  label="MAPE threshold"
+                  unit="%"
+                  hint="Explore until best MAPE is below"
+                  value={beam.mape_threshold}
+                  step="0.1"
+                  onChange={(v) => setB("mape_threshold", v)}
+                />
             </div>
-            <div>
-              <label>Detonation pressure (GPa)</label>
-              <input type="number" step="0.1" value={targets.det_pressure} onChange={(e) => setT("det_pressure", +e.target.value)} />
+            <div className="options">
+                <ToggleField
+                  checked={beam.enable_literature}
+                  onChange={(v) => setB("enable_literature", v)}
+                  label="Literature properties"
+                  description="Prefer curated literature values over model predictions"
+                />
+                <ToggleField
+                  checked={beam.novelty_as_gate}
+                  onChange={(v) => setB("novelty_as_gate", v)}
+                  label="Novelty gate"
+                  description="Reject structures with known literature or patent matches"
+                />
+                <ToggleField
+                  checked={beam.early_stop_on_mape}
+                  onChange={(v) => setB("early_stop_on_mape", v)}
+                  label="Stop at MAPE threshold"
+                  description="End search early once the best candidate meets the threshold"
+                />
             </div>
-            <div>
-              <label>Hf solid (kJ/mol)</label>
-              <input type="number" value={targets.hf_solid} onChange={(e) => setT("hf_solid", +e.target.value)} />
-            </div>
+          </section>
+
+          <ScoringReference />
+
+          <div className="brief-actions">
+              <button type="button" className="action action--primary" onClick={onStart} disabled={running}>
+                {running ? "Searching…" : "Start search"}
+              </button>
+              <button type="button" className="action action--secondary" onClick={onCancel} disabled={!running}>
+                Cancel
+              </button>
+              {jobId && result?.status === "completed" && (
+                <a className="action action--link" href={exportHref}>
+                  Export CSV
+                </a>
+              )}
           </div>
-          <h2 style={{ marginTop: "1.2rem" }}>Beam parameters</h2>
-          <div className="row">
-            <div>
-              <label>Depth</label>
-              <input type="number" value={beam.depth} onChange={(e) => setB("depth", +e.target.value)} />
-            </div>
-            <div>
-              <label>Width</label>
-              <input type="number" value={beam.width} onChange={(e) => setB("width", +e.target.value)} />
-            </div>
-            <div>
-              <label>Top K</label>
-              <input type="number" value={beam.top_k} onChange={(e) => setB("top_k", +e.target.value)} />
-            </div>
-            <div>
-              <label>MAPE threshold (%)</label>
-              <input type="number" step="0.1" value={beam.mape_threshold} onChange={(e) => setB("mape_threshold", +e.target.value)} />
-            </div>
-          </div>
-          <div className="checks">
-            <label><input type="checkbox" checked={beam.enable_literature} onChange={(e) => setB("enable_literature", e.target.checked)} /> Literature properties</label>
-            <label><input type="checkbox" checked={beam.novelty_as_gate} onChange={(e) => setB("novelty_as_gate", e.target.checked)} /> Novelty gate</label>
-            <label><input type="checkbox" checked={beam.early_stop_on_mape} onChange={(e) => setB("early_stop_on_mape", e.target.checked)} /> Stop when MAPE threshold met</label>
-          </div>
-          <button onClick={onStart} disabled={running}>Start search</button>
-          <button className="secondary" onClick={onCancel} disabled={!running}>Cancel</button>
-          {jobId && result?.status === "completed" && (
-            <a href={exportHref} style={{ marginLeft: "0.5rem", color: "#7dd3fc" }}>Export CSV</a>
-          )}
-          {error && <p className="error">{error}</p>}
-        </section>
+          {error && <div className="error-message">{error}</div>}
+        </aside>
 
-        <section className="card">
-          <h2>Live progress</h2>
-          {progress ? (
-            <div className="progress">
-              <div>Job: {progress.job_id}</div>
-              <div>Status: {progress.status}</div>
-              <div>Iteration: {progress.iteration}/{progress.max_iterations}</div>
-              <div>Beam size: {progress.beam_size}</div>
-              <div>Generated: {progress.candidates_generated} · Rejected: {progress.rejected_count}</div>
-              <div>Best MAPE: {progress.best_mape?.toFixed(2) ?? "—"}%</div>
-              <div>Best score: {progress.best_score?.toFixed(4) ?? "—"}</div>
-              <div>{progress.message}</div>
+        <div className="analysis">
+          <header className="analysis-heading">
+            <div>
+              <p className="eyebrow">Target-directed search</p>
+              <h1>Molecular search canvas</h1>
             </div>
-          ) : (
-            <p className="progress">No active run.</p>
-          )}
-          {result?.best && <MoleculeCard title="Best molecule" mol={result.best} />}
-        </section>
-      </div>
+            <p>Seed selection → learned modification → property estimation → beam ranking</p>
+          </header>
 
-      {result?.beam_tree?.nodes?.length ? (
-        <section className="card" style={{ marginTop: "1rem" }}>
-          <h2>Beam search tree</h2>
-          <p className="progress" style={{ marginTop: 0 }}>
-            Depth runs that many expansion iterations; tree columns appear only when a new unique
-            structure is accepted. With early stop off, later iterations may add zero nodes once
-            edits are exhausted — check Live progress for iteration count and the final message.
-            {result.beam_tree.max_generation != null && result.beam_tree.iterations_completed != null ? (
-              <>
-                {" "}
-                This run: {result.beam_tree.iterations_completed}/{beam.depth} iterations,{" "}
-                {result.beam_tree.max_generation} generation
-                {result.beam_tree.max_generation === 1 ? "" : "s"} from seed.
-              </>
-            ) : null}
-          </p>
-          <BeamTreeView tree={result.beam_tree} />
-        </section>
-      ) : null}
+          <TargetProfile targets={targets} />
+          <section className="trajectory">
+            <RunMonitor progress={progress} result={result} />
+          </section>
 
-      {result?.top_k?.length ? (
-        <section className="card" style={{ marginTop: "1rem" }}>
-          <h2>Ranked candidates</h2>
-          {result.top_k.map((m, i) => (
-            <MoleculeCard key={m.id} title={`#${i + 1}`} mol={m} />
-          ))}
-        </section>
-      ) : null}
-    </div>
+        {result?.beam_tree?.nodes?.length ? (
+          <section className="analysis-section">
+            <header className="analysis-section-heading">
+              <p className="eyebrow">Search topology</p>
+              <h2>Reaction tree</h2>
+            </header>
+            <p className="prose">
+              Each column is one modification generation. Depth controls iteration count, not guaranteed
+              columns — later rounds may add no new structures once edits are exhausted.
+              {result.beam_tree.max_generation != null && result.beam_tree.iterations_completed != null ? (
+                <>
+                  {" "}
+                  This run: {result.beam_tree.iterations_completed}/{beam.depth} iterations, generation{" "}
+                  {result.beam_tree.max_generation} from seed.
+                </>
+              ) : null}
+            </p>
+            <BeamTreeView tree={result.beam_tree} />
+          </section>
+        ) : null}
+
+        {result?.top_k?.length ? (
+          <section className="analysis-section">
+            <header className="analysis-section-heading">
+              <p className="eyebrow">Final survivors</p>
+              <h2>Ranked candidates</h2>
+            </header>
+            <div className="candidates">
+              {result.top_k.map((m, i) => (
+                <MoleculeCard key={m.id} title={`Candidate ${i + 1}`} mol={m} rank={i + 1} />
+              ))}
+            </div>
+          </section>
+        ) : null}
+        </div>
+      </main>
+    </>
   );
 }

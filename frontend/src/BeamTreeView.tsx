@@ -68,14 +68,9 @@ function pathToRoot(id: string, byId: Map<string, LayoutNode>): Set<string> {
 function StructureThumb({ smiles, size = 48 }: { smiles: string; size?: number }) {
   const src = `/api/v1/molecule/depict?smiles=${encodeURIComponent(smiles)}&size=${size}`;
   return (
-    <img
-      src={src}
-      alt=""
-      width={size}
-      height={size}
-      style={{ borderRadius: 4, background: "#fff" }}
-      loading="lazy"
-    />
+    <div className="beam-thumb">
+      <img src={src} alt="" width={size} height={size} loading="lazy" />
+    </div>
   );
 }
 
@@ -128,8 +123,8 @@ export function BeamTreeView({ tree }: { tree: BeamSearchTree }) {
         <span className="beam-legend-item beam-legend-best">Best path</span>
         <span className="beam-legend-item beam-legend-beam">In beam</span>
         <span className="beam-legend-item beam-legend-pruned">Expanded / pruned</span>
-        <span className="beam-legend-item beam-planner-learned">Learned planner</span>
-        <span className="beam-legend-item beam-planner-rule">Rule-based</span>
+        <span className="beam-legend-item beam-legend-learned">Learned planner</span>
+        <span className="beam-legend-item beam-legend-rule">Rule-based</span>
       </div>
       <div className="beam-tree-scroll beam-tree-scroll-h">
         <svg width={svgW} height={svgH} className="beam-tree-svg" role="img" aria-label="Beam search tree">
