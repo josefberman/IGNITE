@@ -18,6 +18,7 @@ from backend.app.services.reaction_primitives import (
     list_reagents,
     reagent_id_for_smarts,
 )
+from ml.planner_gap import planner_input_from_parent_target
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,8 @@ def _gap_display(parent_props: Dict[str, float], targets: Dict[str, float]) -> D
 
 
 def _gap_vector(parent_props: Dict[str, float], targets: Dict[str, float]) -> List[float]:
-    return [float(targets[k] - parent_props.get(k, targets[k])) for k in PROPERTY_KEYS]
+    """Planner input: signed normalized (target − parent), aligned with training."""
+    return planner_input_from_parent_target(parent_props, targets)
 
 
 def _primitives_by_family() -> Dict[str, dict]:
@@ -112,7 +114,10 @@ class LearnedPlannerBundle:
                 import torch
 
                 from ml.models.architectures import (
+                    DEFAULT_DROPOUT,
+                    DEFAULT_HEADS,
                     DEFAULT_HIDDEN,
+                    DEFAULT_LAYERS,
                     DeltaPropertyPredictor,
                     ModificationPlanner,
                 )
@@ -122,8 +127,12 @@ class LearnedPlannerBundle:
                 families = meta.get("families") or self.family_names
                 reagents = meta.get("reagents") or self.reagent_names
                 hidden = int(meta.get("hidden", DEFAULT_HIDDEN))
+                layers = int(meta.get("layers", DEFAULT_LAYERS))
+                heads = int(meta.get("heads", DEFAULT_HEADS))
+                dropout = float(meta.get("dropout", DEFAULT_DROPOUT))
+                enc_kw = dict(hidden=hidden, layers=layers, heads=heads, dropout=dropout)
                 model = ModificationPlanner(
-                    n_families=len(families), n_reagents=len(reagents), hidden=hidden
+                    n_families=len(families), n_reagents=len(reagents), **enc_kw
                 )
                 model.load_state_dict(blob["planner"])
                 model.eval()
@@ -137,7 +146,7 @@ class LearnedPlannerBundle:
                     f: [rid for rid in reagents if rid.startswith(f + "__v")] for f in families
                 }
                 if "delta" in blob:
-                    delta_model = DeltaPropertyPredictor(hidden=hidden)
+                    delta_model = DeltaPropertyPredictor(**enc_kw)
                     delta_model.load_state_dict(blob["delta"])
                     delta_model.eval()
                     self._delta_model = delta_model
@@ -156,21 +165,21 @@ class LearnedPlannerBundle:
 
     def _encode(self, parent_smiles: str, gap_vector: Sequence[float]):
         if not self.available or self._model is None:
-            return None, None
+            return None, None, None, None
         import torch
 
         from ml.models.architectures import mol_to_graph
 
         graph = mol_to_graph(parent_smiles)
         if graph is None:
-            return None, None
-        x, _ = graph
+            return None, None, None, None
+        x, edge = graph
         if x.numel() == 0:
-            return None, None
+            return None, None, None, None
         delta = torch.tensor([list(gap_vector)], dtype=torch.float32)
         with torch.no_grad():
-            z, _ = self._model.encode(x.unsqueeze(0), delta)
-        return x, z
+            z, _, atom_emb = self._model.encode(x.unsqueeze(0), delta, edge)
+        return x, z, atom_emb, edge
 
     def propose_families(
         self,
@@ -178,7 +187,7 @@ class LearnedPlannerBundle:
         gap_vector: Sequence[float],
         k: int = 3,
     ) -> List[str]:
-        x, z = self._encode(parent_smiles, gap_vector)
+        x, z, _, _ = self._encode(parent_smiles, gap_vector)
         if z is None or self._model is None:
             return []
         import torch
@@ -200,13 +209,17 @@ class LearnedPlannerBundle:
     ) -> List[str]:
         """Top-k reagent_ids; optionally masked to a single reaction family."""
         if z is None:
-            _, z = self._encode(parent_smiles, gap_vector)
+            _, z, _, _ = self._encode(parent_smiles, gap_vector)
         if z is None or self._model is None:
             return []
         import torch
 
+        fam_idx = None
+        if family_id and family_id in self.family_names:
+            fam_idx = torch.tensor([self.family_names.index(family_id)])
+
         with torch.no_grad():
-            logits = self._model.forward_reagent(z).squeeze(0).clone()
+            logits = self._model.forward_reagent(z, family_idx=fam_idx).squeeze(0).clone()
             if family_id:
                 allowed = set(self.family_to_reagent_ids.get(family_id, []))
                 for i, rid in enumerate(self.reagent_names):
@@ -224,16 +237,16 @@ class LearnedPlannerBundle:
         gap_vector: Sequence[float],
         top_m: int = 8,
         z=None,
-        x=None,
+        atom_emb=None,
     ) -> List[int]:
-        if z is None or x is None:
-            x, z = self._encode(parent_smiles, gap_vector)
-        if z is None or x is None or self._model is None:
+        if z is None or atom_emb is None:
+            _, z, atom_emb, _ = self._encode(parent_smiles, gap_vector)
+        if z is None or atom_emb is None or self._model is None:
             return []
         import torch
 
         with torch.no_grad():
-            scores = self._model.forward_sites(x.unsqueeze(0), z)
+            scores = self._model.forward_sites(atom_emb, z)
             m = max(1, min(top_m, scores.numel()))
             return torch.topk(scores, k=m).indices.tolist()
 
@@ -247,23 +260,13 @@ class LearnedPlannerBundle:
         top_m_sites: int = 8,
     ) -> Tuple[List[str], List[int], Dict[str, List[str]]]:
         """Encode once → families, sites, and per-family ranked reagents."""
-        x, z = self._encode(parent_smiles, gap_vector)
+        _, z, atom_emb, _ = self._encode(parent_smiles, gap_vector)
         if z is None:
             return [], [], {}
         families = self.propose_families(parent_smiles, gap_vector, k=k_families)
-        # Re-use z for sites/reagents (propose_families re-encodes; recompute once here)
-        import torch
-
-        from ml.models.architectures import mol_to_graph
-
-        graph = mol_to_graph(parent_smiles)
-        if graph is None or self._model is None:
-            return families, [], {}
-        x, _ = graph
-        delta = torch.tensor([list(gap_vector)], dtype=torch.float32)
-        with torch.no_grad():
-            z, _ = self._model.encode(x.unsqueeze(0), delta)
-        sites = self.propose_sites(parent_smiles, gap_vector, top_m=top_m_sites, z=z, x=x)
+        sites = self.propose_sites(
+            parent_smiles, gap_vector, top_m=top_m_sites, z=z, atom_emb=atom_emb
+        )
         per_family: Dict[str, List[str]] = {}
         for fam in families:
             per_family[fam] = self.propose_reagents(
@@ -286,7 +289,7 @@ class LearnedPlannerBundle:
         parent_g = mol_to_graph(parent_smiles)
         if parent_g is None:
             return list(children)
-        px, _ = parent_g
+        px, p_edge = parent_g
         gap = torch.tensor(list(gap_vector), dtype=torch.float32)
         scored: List[Tuple[float, str]] = []
         with torch.no_grad():
@@ -295,8 +298,10 @@ class LearnedPlannerBundle:
                 if cg is None:
                     scored.append((-1e9, smi))
                     continue
-                cx, _ = cg
-                pred = self._delta_model(px.unsqueeze(0), cx.unsqueeze(0)).squeeze(0)
+                cx, c_edge = cg
+                pred = self._delta_model(
+                    px.unsqueeze(0), cx.unsqueeze(0), p_edge, c_edge
+                ).squeeze(0)
                 if float(gap.norm()) < 1e-8 or float(pred.norm()) < 1e-8:
                     score = -float(pred.norm())
                 else:
@@ -402,12 +407,16 @@ class ModificationMechanism:
         parent_props: Dict[str, float],
         targets: Dict[str, float],
         n: int,
+        *,
+        forbidden: Optional[set[str]] = None,
     ) -> List[Tuple[str, ModificationRecord]]:
         gap_disp = _gap_display(parent_props, targets)
         gap_vec = _gap_vector(parent_props, targets)
         products: List[Tuple[str, ModificationRecord]] = []
-        seen: set[str] = set()
+        seen: set[str] = set(forbidden or ())
         mol = Chem.MolFromSmiles(parent_smiles)
+        rule_target = max(n * 10, n + len(seen))
+        family_cap = max(8, n * 3)
 
         # --- Learned path: family → reagent → site-biased SMARTS ---
         if self.learned.available and mol is not None:
@@ -427,7 +436,7 @@ class ModificationMechanism:
                     fam,
                     preferred_atoms=sites,
                     preferred_reagent_ids=reag_by_fam.get(fam),
-                    max_products=max(4, n),
+                    max_products=family_cap,
                 ):
                     raw_children.append((smi, fam, reagent_id, smarts))
             order = self.learned.rank_children_by_delta(
@@ -454,7 +463,9 @@ class ModificationMechanism:
             strategy = self.rule.get_strategy(gap_disp)
             fam = strategy.get("primitive", "strategy_pool")
             smarts = (strategy.get("variants") or [{}])[0].get("smarts")
-            for child in self.rule.apply_strategies(parent_smiles, gap_disp, target_count=max(n * 3, n)):
+            for child in self.rule.apply_strategies(
+                parent_smiles, gap_disp, target_count=rule_target
+            ):
                 if self._accept(
                     parent_smiles,
                     child,
@@ -476,7 +487,9 @@ class ModificationMechanism:
                 if len(products) >= n:
                     break
                 fam = prim["family_id"]
-                for smi, reagent_id, smarts in self._apply_family(parent_smiles, mol, fam, max_products=4):
+                for smi, reagent_id, smarts in self._apply_family(
+                    parent_smiles, mol, fam, max_products=family_cap
+                ):
                     if self._accept(
                         parent_smiles,
                         smi,
@@ -488,5 +501,6 @@ class ModificationMechanism:
                         products=products,
                         n=n,
                     ):
-                        break
+                        if len(products) >= n:
+                            break
         return products[:n]

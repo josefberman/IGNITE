@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import math
 from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from rdkit import Chem
 
 
@@ -81,7 +83,54 @@ def mol_to_graph(smiles: str) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     return x, edge_index
 
 
-DEFAULT_HIDDEN = 32
+DEFAULT_HIDDEN = 64
+DEFAULT_LAYERS = 3
+DEFAULT_HEADS = 4
+DEFAULT_DROPOUT = 0.15
+
+
+class BondMessagePass(nn.Module):
+    """One round of bond-neighbor mean aggregation before self-attention."""
+
+    def __init__(self, hidden: int):
+        super().__init__()
+        self.self_lin = nn.Linear(hidden, hidden)
+        self.nei_lin = nn.Linear(hidden, hidden)
+        self.norm = nn.LayerNorm(hidden)
+
+    def forward(self, h: torch.Tensor, edge_index: Optional[torch.Tensor]) -> torch.Tensor:
+        # h: [B, N, H]
+        if edge_index is None or edge_index.numel() == 0:
+            return self.norm(F.gelu(self.self_lin(h)))
+        B, N, H = h.shape
+        if B != 1:
+            raise ValueError("BondMessagePass currently supports batch size 1")
+        h0 = h.squeeze(0)
+        src, dst = edge_index[0], edge_index[1]
+        agg = torch.zeros(N, H, device=h.device, dtype=h.dtype)
+        deg = torch.zeros(N, 1, device=h.device, dtype=h.dtype)
+        agg.index_add_(0, dst, h0[src])
+        deg.index_add_(0, dst, torch.ones(len(dst), 1, device=h.device, dtype=h.dtype))
+        agg = agg / deg.clamp_min(1.0)
+        mixed = self.self_lin(h0) + self.nei_lin(agg)
+        return self.norm(F.gelu(mixed)).unsqueeze(0)
+
+
+class AttentionPool(nn.Module):
+    """Learnable query attention over atom embeddings."""
+
+    def __init__(self, hidden: int):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(hidden) * 0.02)
+
+    def forward(self, h: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # h: [B, N, H] -> [B, H]
+        q = self.query.unsqueeze(0).unsqueeze(0).expand(h.size(0), 1, -1)
+        scores = torch.bmm(q, h.transpose(1, 2)) / math.sqrt(h.size(-1))
+        if mask is not None:
+            scores = scores.masked_fill(mask.unsqueeze(1), -1e9)
+        weights = F.softmax(scores, dim=-1)
+        return torch.bmm(weights, h).squeeze(1)
 
 
 class GraphTransformerEncoder(nn.Module):
@@ -89,40 +138,57 @@ class GraphTransformerEncoder(nn.Module):
         self,
         in_dim: int = ATOM_FEAT_DIM,
         hidden: int = DEFAULT_HIDDEN,
-        layers: int = 3,
-        heads: int = 4,
+        layers: int = DEFAULT_LAYERS,
+        heads: int = DEFAULT_HEADS,
+        dropout: float = DEFAULT_DROPOUT,
     ):
         super().__init__()
         if hidden % heads != 0:
             raise ValueError(f"hidden ({hidden}) must be divisible by heads ({heads})")
-        self.input = nn.Linear(in_dim, hidden)
+        self.hidden = hidden
+        self.input = nn.Sequential(nn.Linear(in_dim, hidden), nn.LayerNorm(hidden))
+        self.bond_mp = BondMessagePass(hidden)
         layer = nn.TransformerEncoderLayer(
-            d_model=hidden, nhead=heads, dim_feedforward=hidden * 2, batch_first=True, dropout=0.1
+            d_model=hidden,
+            nhead=heads,
+            dim_feedforward=hidden * 4,
+            batch_first=True,
+            dropout=dropout,
+            activation="gelu",
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=layers)
-        self.out = nn.Linear(hidden, hidden)
+        self.pool = AttentionPool(hidden)
+        self.out = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, hidden))
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # x: [B, N, F] — for simplicity callers can pass single-graph unsqueezed
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+        *,
+        return_atom_emb: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+        # x: [B, N, F]
         h = self.input(x)
+        h = self.bond_mp(h, edge_index)
         h = self.encoder(h, src_key_padding_mask=mask)
-        # mean pool over atoms
-        if mask is not None:
-            valid = (~mask).float().unsqueeze(-1)
-            h = (h * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1.0)
-        else:
-            h = h.mean(dim=1)
-        return self.out(h)
+        atom_emb = self.out(h)
+        graph_emb = self.pool(atom_emb, mask)
+        if return_atom_emb:
+            return graph_emb, atom_emb
+        return graph_emb
 
 
 class TargetDeltaEncoder(nn.Module):
-    def __init__(self, in_dim: int = 4, hidden: int = DEFAULT_HIDDEN):
+    def __init__(self, in_dim: int = 4, hidden: int = DEFAULT_HIDDEN, dropout: float = DEFAULT_DROPOUT):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
-            nn.ReLU(),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden, hidden),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(hidden, hidden),
         )
 
@@ -131,55 +197,116 @@ class TargetDeltaEncoder(nn.Module):
 
 
 class ModificationPlanner(nn.Module):
-    """Hierarchical: family → site → reagent."""
+    """Hierarchical: family → site → reagent (family-conditioned)."""
 
-    def __init__(self, n_families: int, n_reagents: int, hidden: int = DEFAULT_HIDDEN):
+    def __init__(
+        self,
+        n_families: int,
+        n_reagents: int,
+        hidden: int = DEFAULT_HIDDEN,
+        layers: int = DEFAULT_LAYERS,
+        heads: int = DEFAULT_HEADS,
+        dropout: float = DEFAULT_DROPOUT,
+    ):
         super().__init__()
         self.hidden = hidden
-        self.parent_enc = GraphTransformerEncoder(hidden=hidden)
-        self.delta_enc = TargetDeltaEncoder(hidden=hidden)
-        self.fuse = nn.Sequential(nn.Linear(hidden * 2, hidden), nn.ReLU())
+        self.n_families = n_families
+        self.n_reagents = n_reagents
+        enc_kw = dict(hidden=hidden, layers=layers, heads=heads, dropout=dropout)
+        self.parent_enc = GraphTransformerEncoder(**enc_kw)
+        self.delta_enc = TargetDeltaEncoder(hidden=hidden, dropout=dropout)
+        self.fuse = nn.Sequential(
+            nn.Linear(hidden * 2, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
         self.family_head = nn.Linear(hidden, n_families)
-        self.site_head = nn.Linear(hidden, 1)  # applied per-atom via broadcast in training loop
-        self.reagent_head = nn.Linear(hidden, n_reagents)
-        self.atom_proj = nn.Linear(ATOM_FEAT_DIM, hidden)
+        self.reagent_head = nn.Sequential(
+            nn.Linear(hidden + n_families, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, n_reagents),
+        )
+        self.site_head = nn.Linear(hidden, 1)
+        self.site_cross = nn.MultiheadAttention(
+            hidden, num_heads=min(heads, hidden // 8), batch_first=True, dropout=dropout
+        )
 
-    def encode(self, atom_x: torch.Tensor, delta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # atom_x: [1, N, F]
-        parent_z = self.parent_enc(atom_x)
+    def encode(
+        self,
+        atom_x: torch.Tensor,
+        delta: torch.Tensor,
+        edge_index: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # atom_x: [1, N, F] -> z [1, H], parent_z [1, H], atom_emb [1, N, H]
+        parent_z, atom_emb = self.parent_enc(atom_x, edge_index, return_atom_emb=True)
         delta_z = self.delta_enc(delta)
         z = self.fuse(torch.cat([parent_z, delta_z], dim=-1))
-        return z, parent_z
+        return z, parent_z, atom_emb
 
     def forward_family(self, z: torch.Tensor) -> torch.Tensor:
         return self.family_head(z)
 
-    def forward_reagent(self, z: torch.Tensor) -> torch.Tensor:
-        return self.reagent_head(z)
+    def _family_features(
+        self,
+        z: torch.Tensor,
+        family_idx: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if family_idx is not None:
+            return F.one_hot(family_idx, self.n_families).to(dtype=z.dtype, device=z.device)
+        fam_logits = self.family_head(z)
+        return F.softmax(fam_logits, dim=-1)
 
-    def forward_sites(self, atom_x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        # returns [N] logits for reacting-site probability
-        atom_h = torch.relu(self.atom_proj(atom_x.squeeze(0)))
-        context = z.squeeze(0)
-        gated = atom_h * context
-        return self.site_head(gated).squeeze(-1)
+    def forward_reagent(
+        self,
+        z: torch.Tensor,
+        *,
+        family_idx: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        fam_feat = self._family_features(z, family_idx)
+        return self.reagent_head(torch.cat([z, fam_feat], dim=-1))
+
+    def forward_sites(self, atom_emb: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        # atom_emb: [B, N, H], z: [B, H] -> [N] logits (batch size 1 at train/infer)
+        ctx, _ = self.site_cross(z.unsqueeze(1), atom_emb, atom_emb)
+        fused = atom_emb + ctx.expand_as(atom_emb)
+        logits = self.site_head(fused).squeeze(-1)
+        if logits.dim() == 2 and logits.size(0) == 1:
+            return logits.squeeze(0)
+        return logits
 
 
 class DeltaPropertyPredictor(nn.Module):
-    def __init__(self, hidden: int = DEFAULT_HIDDEN, out_dim: int = 4):
+    def __init__(
+        self,
+        hidden: int = DEFAULT_HIDDEN,
+        out_dim: int = 4,
+        layers: int = DEFAULT_LAYERS,
+        heads: int = DEFAULT_HEADS,
+        dropout: float = DEFAULT_DROPOUT,
+    ):
         super().__init__()
         self.hidden = hidden
-        self.parent_enc = GraphTransformerEncoder(hidden=hidden)
-        self.child_enc = GraphTransformerEncoder(hidden=hidden)
+        enc_kw = dict(hidden=hidden, layers=layers, heads=heads, dropout=dropout)
+        self.parent_enc = GraphTransformerEncoder(**enc_kw)
+        self.child_enc = GraphTransformerEncoder(**enc_kw)
         self.head = nn.Sequential(
             nn.Linear(hidden * 2, hidden),
-            nn.ReLU(),
+            nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden, out_dim),
         )
 
-    def forward(self, parent_x: torch.Tensor, child_x: torch.Tensor) -> torch.Tensor:
-        p = self.parent_enc(parent_x)
-        c = self.child_enc(child_x)
+    def forward(
+        self,
+        parent_x: torch.Tensor,
+        child_x: torch.Tensor,
+        parent_edge: Optional[torch.Tensor] = None,
+        child_edge: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        p = self.parent_enc(parent_x, parent_edge)
+        c = self.child_enc(child_x, child_edge)
         return self.head(torch.cat([p, c], dim=-1))
 
 

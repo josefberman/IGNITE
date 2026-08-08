@@ -73,6 +73,7 @@ def _clamp_beam(beam: BeamParameters) -> BeamParameters:
         enable_literature=beam.enable_literature,
         enable_patent_search=beam.enable_patent_search,
         novelty_as_gate=beam.novelty_as_gate,
+        early_stop_on_mape=beam.early_stop_on_mape,
     )
 
 
@@ -88,13 +89,16 @@ def _run_job(job_id: str) -> None:
                 controller.request_stop()
             store.update_progress(progress)
 
-        best, top, progress = controller.run(job_id, req.targets, beam, on_progress=on_progress)
+        best, top, progress, beam_tree = controller.run(
+            job_id, req.targets, beam, on_progress=on_progress
+        )
         result = SearchResult(
             job_id=job_id,
             status=progress.status,
             best=best,
             top_k=top,
             progress=progress,
+            beam_tree=beam_tree,
         )
         store.set_result(result)
     except Exception as e:

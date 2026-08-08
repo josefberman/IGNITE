@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { cancelSearch, createSearch, getProgress, getResult } from "./api/client";
+import { BeamTreeView } from "./BeamTreeView";
 import type {
   BeamParameters,
   CandidateMolecule,
@@ -24,6 +25,7 @@ const DEFAULT_BEAM: BeamParameters = {
   enable_literature: true,
   enable_patent_search: true,
   novelty_as_gate: false,
+  early_stop_on_mape: false,
 };
 
 function StructureImage({ smiles, size = 220 }: { smiles: string; size?: number }) {
@@ -84,6 +86,13 @@ function ScoringGuide() {
   );
 }
 
+function plannerBadge(planner?: string, generation?: number): string | null {
+  if (generation === 0) return "Seed";
+  if (planner === "learned") return "Learned planner";
+  if (planner === "rule_based") return "Rule-based";
+  return null;
+}
+
 function MoleculeCard({ title, mol }: { title: string; mol: CandidateMolecule }) {
   const props = mol.properties || {};
   return (
@@ -98,6 +107,11 @@ function MoleculeCard({ title, mol }: { title: string; mol: CandidateMolecule })
             <span>MAPE {mol.mape?.toFixed(2)}%</span>
             {mol.score && <span>Score {mol.score.total.toFixed(3)}</span>}
             {mol.modification && <span>{mol.modification.reaction_family}</span>}
+            {plannerBadge(mol.modification?.planner, mol.generation) && (
+              <span className={mol.modification?.planner === "learned" ? "badge-learned" : mol.generation === 0 ? "" : "badge-rule"}>
+                {plannerBadge(mol.modification?.planner, mol.generation)}
+              </span>
+            )}
             <span>gen {mol.generation}</span>
             {Object.values(props)[0] && <span>source {Object.values(props)[0].source}</span>}
           </div>
@@ -203,9 +217,6 @@ export default function App() {
         <h1>IGNITE</h1>
         <p>Intelligent Generation and Navigation through Iterative Transformations of Energetics</p>
       </header>
-      <div className="disclaimer">
-        Computational design candidates only — not experimental validation or a legal novelty / patentability opinion.
-      </div>
 
       <ScoringGuide />
 
@@ -252,6 +263,7 @@ export default function App() {
           <div className="checks">
             <label><input type="checkbox" checked={beam.enable_literature} onChange={(e) => setB("enable_literature", e.target.checked)} /> Literature properties</label>
             <label><input type="checkbox" checked={beam.novelty_as_gate} onChange={(e) => setB("novelty_as_gate", e.target.checked)} /> Novelty gate</label>
+            <label><input type="checkbox" checked={beam.early_stop_on_mape} onChange={(e) => setB("early_stop_on_mape", e.target.checked)} /> Stop when MAPE threshold met</label>
           </div>
           <button onClick={onStart} disabled={running}>Start search</button>
           <button className="secondary" onClick={onCancel} disabled={!running}>Cancel</button>
@@ -278,9 +290,28 @@ export default function App() {
             <p className="progress">No active run.</p>
           )}
           {result?.best && <MoleculeCard title="Best molecule" mol={result.best} />}
-          {result?.disclaimer && <p className="progress">{result.disclaimer}</p>}
         </section>
       </div>
+
+      {result?.beam_tree?.nodes?.length ? (
+        <section className="card" style={{ marginTop: "1rem" }}>
+          <h2>Beam search tree</h2>
+          <p className="progress" style={{ marginTop: 0 }}>
+            Depth runs that many expansion iterations; tree columns appear only when a new unique
+            structure is accepted. With early stop off, later iterations may add zero nodes once
+            edits are exhausted — check Live progress for iteration count and the final message.
+            {result.beam_tree.max_generation != null && result.beam_tree.iterations_completed != null ? (
+              <>
+                {" "}
+                This run: {result.beam_tree.iterations_completed}/{beam.depth} iterations,{" "}
+                {result.beam_tree.max_generation} generation
+                {result.beam_tree.max_generation === 1 ? "" : "s"} from seed.
+              </>
+            ) : null}
+          </p>
+          <BeamTreeView tree={result.beam_tree} />
+        </section>
+      ) : null}
 
       {result?.top_k?.length ? (
         <section className="card" style={{ marginTop: "1rem" }}>

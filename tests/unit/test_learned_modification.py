@@ -73,7 +73,7 @@ def test_reacting_atom_indices_nonzero():
     assert all(0 <= i < mol.GetNumAtoms() for i in sites)
 
 
-def test_site_loss_trains_atom_proj():
+def test_site_loss_trains_site_head():
     from ml.training.train_planner import _site_loss
 
     families = [p["family_id"] for p in list_primitives() if p["family_id"] != "identity"]
@@ -81,13 +81,13 @@ def test_site_loss_trains_atom_proj():
     planner = ModificationPlanner(n_families=len(families), n_reagents=len(reagents))
     g = mol_to_graph("c1ccccc1N(=O)=O")
     assert g is not None
-    x, _ = g
+    x, edge = g
     target = torch.zeros(x.size(0))
     target[0] = 1.0
     opt = torch.optim.Adam(planner.parameters(), lr=1e-2)
     before = planner.site_head.weight.detach().clone()
-    z, _ = planner.encode(x.unsqueeze(0), torch.zeros(1, 4))
-    logits = planner.forward_sites(x.unsqueeze(0), z)
+    z, _, atom_emb = planner.encode(x.unsqueeze(0), torch.zeros(1, 4), edge)
+    logits = planner.forward_sites(atom_emb, z)
     loss = _site_loss(logits, target)
     loss.backward()
     opt.step()
@@ -117,3 +117,40 @@ def test_expand_records_reagent_id(tmp_path: Path):
         assert rec.reagent
         if rec.planner == "learned":
             assert "__v" in rec.reagent or rec.reagent == rec.reaction_family
+
+
+def test_eval_inference_metrics_oracle_vs_predicted_family():
+    from ml.training.train_planner import _eval_inference_metrics
+
+    families = ["fam_a", "fam_b"]
+    family_to_reagent_idxs = {
+        "fam_a": [0, 1],
+        "fam_b": [2, 3],
+    }
+    fam_logits = torch.tensor([[0.1, 2.0]])  # predict fam_b
+    site_target = torch.zeros(4)
+    site_target[1] = 1.0
+    site_logits = torch.tensor([0.0, 3.0, 0.0, 0.0])
+
+    def reag_logits_fn(family_idx: torch.Tensor) -> torch.Tensor:
+        # family 0 -> prefers reagent 0; family 1 -> prefers reagent 2
+        if int(family_idx.item()) == 0:
+            return torch.tensor([[5.0, 0.0, -5.0, -5.0]])
+        return torch.tensor([[-5.0, -5.0, 5.0, 0.0]])
+
+    # true fam_a + reag 0: oracle ok, inference reag wrong (predicted fam_b -> reag 2)
+    m = _eval_inference_metrics(
+        fam_logits,
+        reag_logits_fn,
+        site_logits,
+        true_fam=0,
+        true_reag=0,
+        site_target=site_target,
+        families=families,
+        family_to_reagent_idxs=family_to_reagent_idxs,
+    )
+    assert m["fam"] is False
+    assert m["reag_oracle"] is True
+    assert m["reag"] is False
+    assert m["plan"] is False
+    assert m["site"] is True

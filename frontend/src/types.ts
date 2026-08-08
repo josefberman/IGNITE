@@ -14,6 +14,7 @@ export type BeamParameters = {
   enable_literature: boolean;
   enable_patent_search: boolean;
   novelty_as_gate: boolean;
+  early_stop_on_mape: boolean;
 };
 
 export type SearchProgress = {
@@ -52,11 +53,32 @@ export type CandidateMolecule = {
   lineage: string[];
 };
 
+export type BeamTreeNode = {
+  id: string;
+  parent_id?: string | null;
+  generation: number;
+  canonical_smiles: string;
+  mape: number;
+  score_total?: number | null;
+  reaction_family?: string | null;
+  planner?: string | null;
+  in_beam: boolean;
+};
+
+export type BeamSearchTree = {
+  nodes: BeamTreeNode[];
+  beam_layers: string[][];
+  best_id?: string | null;
+  max_generation?: number;
+  iterations_completed?: number;
+};
+
 export type SearchResult = {
   job_id: string;
   status: string;
   best?: CandidateMolecule;
   top_k: CandidateMolecule[];
   progress: SearchProgress;
+  beam_tree?: BeamSearchTree | null;
   disclaimer: string;
 };

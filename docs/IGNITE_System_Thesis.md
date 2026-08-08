@@ -589,7 +589,7 @@ External measured reaction / hazard CSVs can be ingested via `ml/data_gen/ingest
 - `DeltaPropertyPredictor` — multi-task Δy regression
 - Optional `UncertaintyEnsemble` for epistemic spread
 
-Training entrypoint: `ml/training/train_planner.py` → checkpoint `ml/checkpoints/planner.pt` (family CE + reagent CE + reacting-site BCE + Δy MSE). Reagent labels are the concrete SMARTS variants in `list_reagents()`, not a copy of the family vocab.
+Training entrypoint: `ml/training/train_planner.py` → checkpoint `ml/checkpoints/planner.pt` (family CE + reagent CE + reacting-site BCE + Δy MSE). The planner sees a **signed normalized (target − parent)** gap (same encoding at inference), with optional target jitter during training so it does not memorize exact outcome deltas. Early stopping saves the best checkpoint by validation **family top‑1** (unmasked).
 
 ### 15.3 Online use
 

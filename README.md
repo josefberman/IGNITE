@@ -43,8 +43,8 @@ Open [http://localhost:5173](http://localhost:5173) (Vite proxies `/api` → `ht
 # Generate weak-supervision parent→child pairs (scaffold-split)
 python -m ml.data_gen.generate_pairs --max-parents 200 --max-per-parent 3
 
-# Train Graph Transformer planner + delta predictor
-python -m ml.training.train_planner --epochs 3
+# Train Graph Transformer planner + delta predictor (early-stops on val family accuracy)
+python -m ml.training.train_planner --epochs 20 --patience 5
 ```
 
 Checkpoints land in `ml/checkpoints/planner.pt` and are loaded automatically when present.

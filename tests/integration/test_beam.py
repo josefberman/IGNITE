@@ -52,9 +52,13 @@ def test_beam_search_bounded(controller):
         random_seed=0,
         enable_literature=True,
         enable_patent_search=False,
+        early_stop_on_mape=False,
     )
-    best, top, progress = controller.run("test-job", targets, beam)
+    best, top, progress, beam_tree = controller.run("test-job", targets, beam)
     assert best.canonical_smiles
+    assert len(beam_tree.nodes) >= 1
+    assert len(beam_tree.beam_layers) >= 1
+    assert beam_tree.best_id == best.id
     assert best.score is not None
     assert len(top) >= 1
     assert progress.status.value in ("completed", "cancelled")

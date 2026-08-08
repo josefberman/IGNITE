@@ -82,6 +82,11 @@ class BeamParameters(BaseModel):
     enable_literature: bool = True
     enable_patent_search: bool = True
     novelty_as_gate: bool = False
+    early_stop_on_mape: bool = Field(
+        False,
+        description="Stop search when best MAPE meets threshold (after ≥1 expansion). "
+        "Disable to always run the full depth.",
+    )
 
 
 class ScoreBreakdown(BaseModel):
@@ -193,12 +198,37 @@ class SearchProgress(BaseModel):
     message: str = ""
 
 
+class BeamTreeNode(BaseModel):
+    """Lightweight node for beam-search tree visualization."""
+
+    id: str
+    parent_id: Optional[str] = None
+    generation: int = 0
+    canonical_smiles: str
+    mape: float = 100.0
+    score_total: Optional[float] = None
+    reaction_family: Optional[str] = None
+    planner: Optional[str] = None
+    in_beam: bool = False
+
+
+class BeamSearchTree(BaseModel):
+    """Directed forest of accepted expansions; layers list beam survivor ids per iteration."""
+
+    nodes: List[BeamTreeNode] = Field(default_factory=list)
+    beam_layers: List[List[str]] = Field(default_factory=list)
+    best_id: Optional[str] = None
+    max_generation: int = 0
+    iterations_completed: int = 0
+
+
 class SearchResult(BaseModel):
     job_id: str
     status: JobStatus
     best: Optional[CandidateMolecule] = None
     top_k: List[CandidateMolecule] = Field(default_factory=list)
     progress: SearchProgress
+    beam_tree: Optional[BeamSearchTree] = None
     disclaimer: str = (
         "Outputs are computational design candidates only — not experimental validation "
         "or a legal novelty / patentability opinion."

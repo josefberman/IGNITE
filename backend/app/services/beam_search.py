@@ -9,6 +9,8 @@ from typing import Callable, List, Optional
 
 from backend.app.domain.models import (
     BeamParameters,
+    BeamSearchTree,
+    BeamTreeNode,
     CandidateMolecule,
     JobStatus,
     NoveltyStatus,
@@ -95,8 +97,9 @@ class BeamSearchController:
         targets: TargetProperties,
         beam: BeamParameters,
         on_progress: Optional[ProgressCallback] = None,
-    ) -> tuple[CandidateMolecule, List[CandidateMolecule], SearchProgress]:
+    ) -> tuple[CandidateMolecule, List[CandidateMolecule], SearchProgress, BeamSearchTree]:
         self._stop = False
+        tree = BeamSearchTree()
         rng = random.Random(beam.random_seed)
         self.modification.rng = rng
 
@@ -110,7 +113,7 @@ class BeamSearchController:
 
         target_dict = targets.as_dict()
         seed_pool = self.seeds.select_seeds(
-            targets, mape_threshold=max(beam.mape_threshold, 25.0), max_seeds=max(beam.top_k, 3)
+            targets, mape_threshold=max(beam.mape_threshold, 25.0), max_seeds=1
         )
         if not seed_pool:
             raise ValueError("No seed molecules available")
@@ -128,7 +131,7 @@ class BeamSearchController:
         if not seed_pool:
             raise ValueError("No seed molecules available after novelty gate")
 
-        beam_nodes = sorted(seed_pool, key=lambda c: c.score.total if c.score else 1e9)[: beam.top_k]
+        beam_nodes = sorted(seed_pool, key=lambda c: c.score.total if c.score else 1e9)[:1]
         best = beam_nodes[0]
         seen = {c.canonical_smiles for c in beam_nodes}
         rejected = 0
@@ -146,6 +149,39 @@ class BeamSearchController:
 
         for s in beam_nodes:
             _tally(s)
+
+        def _tree_node(c: CandidateMolecule, *, in_beam: bool) -> BeamTreeNode:
+            mod = c.modification
+            return BeamTreeNode(
+                id=c.id,
+                parent_id=c.parent_id,
+                generation=c.generation,
+                canonical_smiles=c.canonical_smiles,
+                mape=c.mape,
+                score_total=c.score.total if c.score else None,
+                reaction_family=mod.reaction_family if mod else None,
+                planner=mod.planner if mod else None,
+                in_beam=in_beam,
+            )
+
+        def _register(c: CandidateMolecule, *, in_beam: bool) -> None:
+            tree.nodes.append(_tree_node(c, in_beam=in_beam))
+
+        def _sync_beam_layer(nodes: List[CandidateMolecule]) -> None:
+            for n in tree.nodes:
+                n.in_beam = False
+            ids = []
+            for c in nodes:
+                ids.append(c.id)
+                for i, existing in enumerate(tree.nodes):
+                    if existing.id == c.id:
+                        tree.nodes[i] = _tree_node(c, in_beam=True)
+                        break
+                else:
+                    _register(c, in_beam=True)
+            tree.beam_layers.append(ids)
+
+        _sync_beam_layer(beam_nodes)
 
         def emit(iteration: int, status: JobStatus, message: str) -> SearchProgress:
             prog = SearchProgress(
@@ -179,8 +215,17 @@ class BeamSearchController:
 
             # Early stop only when threshold met AND we have finished at least one expansion
             # if seeds already meet threshold — allow returning seed; otherwise always expand once.
-            if best.mape <= beam.mape_threshold and iteration > 1:
-                progress = emit(iteration - 1, JobStatus.COMPLETED, "MAPE threshold reached")
+            if (
+                beam.early_stop_on_mape
+                and best.mape <= beam.mape_threshold
+                and iteration > 1
+            ):
+                max_gen = max((n.generation for n in tree.nodes), default=0)
+                progress = emit(
+                    iteration - 1,
+                    JobStatus.COMPLETED,
+                    f"MAPE threshold reached ({max_gen} tree generations from seed)",
+                )
                 break
             if best.mape <= beam.mape_threshold and iteration == 1 and best.generation == 0:
                 # Still run one modification pass to seek novelty/improvement
@@ -193,6 +238,7 @@ class BeamSearchController:
                     parent.property_values(),
                     target_dict,
                     n=beam.width,
+                    forbidden=seen,
                 )
                 for child_smi, mod in expansions:
                     generated += 1
@@ -240,6 +286,7 @@ class BeamSearchController:
                     cand.mape = cand.score.mape
                     seen.add(child_smi)
                     children.append(cand)
+                    _register(cand, in_beam=False)
                     _tally(cand)
 
             pool = beam_nodes + children
@@ -249,6 +296,7 @@ class BeamSearchController:
                 c.mape = c.score.mape
 
             beam_nodes = self._select_survivors(pool, beam.top_k, explore=exploring)
+            _sync_beam_layer(beam_nodes)
             if beam_nodes:
                 # Final best: prefer lowest total among survivors; break seed ties by MAPE
                 candidate_best = min(
@@ -282,10 +330,18 @@ class BeamSearchController:
             )
 
         else:
-            progress = emit(beam.depth, JobStatus.COMPLETED, "Depth limit reached")
+            max_gen = max((n.generation for n in tree.nodes), default=0)
+            progress = emit(
+                beam.depth,
+                JobStatus.COMPLETED,
+                f"Depth limit reached ({max_gen} tree generations from seed)",
+            )
 
         if progress.status == JobStatus.RUNNING:
             progress.status = JobStatus.COMPLETED
+
+        tree.max_generation = max((n.generation for n in tree.nodes), default=0)
+        tree.iterations_completed = progress.iteration
 
         # Final ranking without explore bias
         for c in beam_nodes:
@@ -298,4 +354,5 @@ class BeamSearchController:
         for c in top:
             c.strip_internal_signals()
         best.strip_internal_signals()
-        return best, top, progress
+        tree.best_id = best.id
+        return best, top, progress, tree
