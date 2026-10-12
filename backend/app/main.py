@@ -59,7 +59,10 @@ def _build_controller(beam: BeamParameters | None = None) -> BeamSearchControlle
         lens_api_key=settings.lens_api_key if (beam is None or beam.enable_patent_search) else "",
         identity_resolver=identity,
     )
-    mod = ModificationMechanism(checkpoint_dir=settings.learned_checkpoint_dir)
+    mod = ModificationMechanism(
+        checkpoint_dir=settings.learned_checkpoint_dir,
+        property_predictor=predictor,
+    )
     return BeamSearchController(seeds, estimator, novelty, mod)
 
 

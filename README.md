@@ -104,7 +104,7 @@ Outputs in `--out-dir`:
 
 ### 3. Train the planner
 
-Trains `ModificationPlanner` (family, reagent, and site heads) and `DeltaPropertyPredictor` (parent+child → four property deltas) on the pairs CSV. Early stopping uses validation family top-1, site top-1, and reagent-given-true-family accuracy. The best epoch is written to the checkpoint.
+Trains `ModificationPlanner` (family, reagent, and site heads) on the pairs CSV. Property changes are scored by the XGBoost regressors, not by a second network. Early stopping uses validation family top-1, site top-1, and reagent-given-true-family accuracy. The best epoch is written to the checkpoint.
 
 ```bash
 python -m ml.training.train_planner --epochs 30 --patience 7

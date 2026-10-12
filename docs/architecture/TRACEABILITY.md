@@ -24,11 +24,11 @@ Maps every architecture-diagram box to an owned IGNITE module.
 | Diagram box | Module |
 |-------------|--------|
 | Parent Molecule Encoder | [`ml/models/architectures.py`](../../ml/models/architectures.py) `GraphEncoder` (bond MP + mean pool) |
-| Target gap injection | `ModificationPlanner.fuse` — concat raw 4-d gap with `parent_z` |
+| Target gap injection | FiLM on the global vector and on the local and context atom embeddings |
 | Reaction Family / Site / Reagent selectors | `ModificationPlanner` (+ rule fallback in `ModificationMechanism`) |
 | Reaction Executor | RDKit SMARTS in `reaction_primitives.py` / `modification.py` |
 | Chemical Validity Filter | [`chemistry.py`](../../backend/app/services/chemistry.py) `validate_molecule` |
-| Delta-Property Predictor | `DeltaPropertyPredictor` + absolute XGBoost baseline |
+| Property delta | XGBoost absolute models: child prediction minus parent prediction |
 | Uncertainty Estimator | `uncertainty.py` + ensemble hooks |
 | Safety Estimator | [`safety.py`](../../backend/app/services/safety.py) |
 | Modification Ranker | `scoring.py` `score_candidate` |

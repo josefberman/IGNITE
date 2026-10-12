@@ -583,13 +583,11 @@ External measured reaction / hazard CSVs can be ingested via `ml/data_gen/ingest
 
 `ml/models/architectures.py`:
 
-- `GraphEncoder` — parent (and child) graph encoding via stacked bond message-passing + mean pool
-- Gap fuse — raw 4-d signed-normalized target−parent gap concatenated into `ModificationPlanner.fuse`
-- `ModificationPlanner` — hierarchical heads for reaction family, site scores, and reagent (SMARTS variant)
-- `DeltaPropertyPredictor` — multi-task Δy regression
-- Optional `UncertaintyEnsemble` for epistemic spread
+- `GraphEncoder` — parent graph encoding via stacked bond message-passing + mean pool
+- Gap — FiLM from the signed-normalized target−parent gap, applied once to the global vector and to the local and context atom embeddings
+- `ModificationPlanner` — hierarchical heads for reaction family, site scores, and reagent
 
-Training entrypoint: `ml/training/train_planner.py` → checkpoint `ml/checkpoints/planner.pt` (family CE + reagent CE + reacting-site BCE + Δy MSE). The planner sees a **signed normalized (target − parent)** gap (same encoding at inference), with optional target jitter during training so it does not memorize exact outcome deltas. Early stopping saves the best checkpoint by validation **family top‑1** (unmasked).
+Training entrypoint: `ml/training/train_planner.py` → checkpoint `ml/checkpoints/planner.pt` (family CE + reagent CE + reacting-site loss). The planner sees a **signed normalized (target − parent)** gap (same encoding at inference), with optional target jitter during training so it does not memorize exact outcome deltas. Early stopping saves the best checkpoint by validation **family top‑1** (unmasked). Property deltas used to choose among products come from the XGBoost regressors.
 
 ### 15.3 Online use
 
@@ -599,7 +597,7 @@ When `ml/checkpoints/planner.pt` loads:
 2. Take top-k **reaction families** from the family head.
 3. For each family, take top-k **reagents** from the reagent head **masked** to that family’s variants (`{family}__v{i}`).
 4. Score atoms with the **site head** and prefer SMARTS matches that hit those atoms.
-5. Execute preferred SMARTS via RDKit in reagent order; optionally reorder children with `DeltaPropertyPredictor` (cosine alignment of predicted Δy to the target gap).
+5. Execute preferred SMARTS via RDKit in reagent order, then reorder children by cosine alignment of the XGBoost property delta to the target gap.
 6. Tag accepted children `planner="learned"` and record `reagent` as the variant id.
 
 If the checkpoint is missing/unloadable or too few valid children are produced, the rule-based strategy pool (and remaining primitives) fill the expansion. Beam search itself is unchanged: it still calls `ModificationMechanism.expand` per parent.

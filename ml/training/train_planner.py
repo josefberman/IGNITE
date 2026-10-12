@@ -25,7 +25,6 @@ from ml.models.architectures import (
     DEFAULT_HEADS,
     DEFAULT_HIDDEN,
     DEFAULT_LAYERS,
-    DeltaPropertyPredictor,
     ModificationPlanner,
     mol_to_graph,
 )
@@ -289,14 +288,8 @@ def train(
     planner = ModificationPlanner(
         n_families=len(families), n_reagents=len(reagents), **enc_kw
     )
-    delta_model = DeltaPropertyPredictor(**enc_kw)
-    opt = torch.optim.AdamW(
-        list(planner.parameters()) + list(delta_model.parameters()),
-        lr=lr,
-        weight_decay=weight_decay,
-    )
+    opt = torch.optim.AdamW(planner.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, epochs), eta_min=lr * 0.05)
-    scale = torch.tensor([1.0, 1000.0, 10.0, 100.0], dtype=torch.float32)
 
     def _allowed_families(smiles: str, gold: int) -> list[int]:
         allowed = list(family_allow.get(smiles) or [])
@@ -327,41 +320,32 @@ def train(
     log_every = 500
     for epoch in range(epochs):
         planner.train()
-        delta_model.train()
         total_loss = 0.0
         n = 0
         opt.zero_grad(set_to_none=True)
         micro = 0
         print(f"epoch {epoch+1}/{epochs} train ({n_train} pairs)", flush=True)
         for batch in train_loader:
-            for px, p_edge, cx, c_edge, fam, reag, delta, planner_gap, site_target, parent_smi in batch:
+            for px, p_edge, _cx, _c_edge, fam, reag, _delta, planner_gap, site_target, parent_smi in batch:
                 px_b = px.unsqueeze(0)
-                cx_b = cx.unsqueeze(0)
                 gap_b = planner_gap.unsqueeze(0)
                 fam_t = torch.tensor([fam])
                 z, _, atom_emb = planner.encode(px_b, gap_b, p_edge)
                 fam_logits = _mask_class_logits(
-                    planner.forward_family(z, gap_b),
+                    planner.forward_family(z),
                     _allowed_families(parent_smi, fam),
                 )
                 reag_logits = _mask_reagent_logits(
-                    planner.forward_reagent(z, family_idx=fam_t, gap=gap_b, atom_emb=atom_emb),
+                    planner.forward_reagent(z, family_idx=fam_t),
                     _allowed_reagents(parent_smi, fam, reag),
                 )
-                site_logits = planner.forward_sites(atom_emb, z, gap_b)
+                site_logits = planner.forward_sites(atom_emb)
                 # Applicability masks use -1e9; label smoothing would assign
                 # mass to those classes and blow up the loss.
                 loss_fam = F.cross_entropy(fam_logits, fam_t, weight=fam_weights)
                 loss_reag = F.cross_entropy(reag_logits, torch.tensor([reag]))
                 loss_site = _site_loss(site_logits, site_target)
-                pred_delta = delta_model(px_b, cx_b, p_edge, c_edge)
-                loss_delta = F.mse_loss(pred_delta.squeeze(0) / scale, delta / scale)
-                loss = (
-                    loss_fam
-                    + loss_reag_weight * loss_reag
-                    + loss_site_weight * loss_site
-                    + loss_delta
-                )
+                loss = loss_fam + loss_reag_weight * loss_reag + loss_site_weight * loss_site
                 (loss / accum_steps).backward()
                 micro += 1
                 total_loss += float(loss.item())
@@ -370,25 +354,18 @@ def train(
                     print(f"  train {n}/{n_train} loss={total_loss / n:.4f}", flush=True)
                 if micro % accum_steps == 0:
                     if grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            list(planner.parameters()) + list(delta_model.parameters()),
-                            grad_clip,
-                        )
+                        torch.nn.utils.clip_grad_norm_(planner.parameters(), grad_clip)
                     opt.step()
                     opt.zero_grad(set_to_none=True)
         if micro % accum_steps:
             if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    list(planner.parameters()) + list(delta_model.parameters()),
-                    grad_clip,
-                )
+                torch.nn.utils.clip_grad_norm_(planner.parameters(), grad_clip)
             opt.step()
             opt.zero_grad(set_to_none=True)
         scheduler.step()
         avg = total_loss / max(1, n)
 
         planner.eval()
-        delta_model.eval()
         print(f"epoch {epoch+1}/{epochs} val ({len(val_ds)} pairs)", flush=True)
         val_loss = 0.0
         counts = {
@@ -408,25 +385,23 @@ def train(
                 for (
                     px,
                     p_edge,
-                    cx,
-                    c_edge,
+                    _cx,
+                    _c_edge,
                     fam,
                     reag,
-                    delta,
+                    _delta,
                     planner_gap,
                     site_target,
                     parent_smi,
                 ) in batch:
                     px_b = px.unsqueeze(0)
-                    cx_b = cx.unsqueeze(0)
                     gap_b = planner_gap.unsqueeze(0)
                     fam_t = torch.tensor([fam])
                     allowed_fam = _allowed_families(parent_smi, fam)
                     z, _, atom_emb = planner.encode(px_b, gap_b, p_edge)
-                    fam_logits = planner.forward_family(z, gap_b)
+                    fam_logits = planner.forward_family(z)
                     fam_logits_m = _mask_class_logits(fam_logits, allowed_fam)
-                    site_logits = planner.forward_sites(atom_emb, z, gap_b)
-                    pred_delta = delta_model(px_b, cx_b, p_edge, c_edge)
+                    site_logits = planner.forward_sites(atom_emb)
 
                     def reag_logits_fn(family_idx: torch.Tensor) -> torch.Tensor:
                         idx = int(family_idx.item())
@@ -435,9 +410,7 @@ def train(
                         gold = reag if idx == fam else None
                         pooled = _allowed_reagents(parent_smi, idx, gold)
                         return _mask_reagent_logits(
-                            planner.forward_reagent(
-                                z, family_idx=family_idx, gap=gap_b, atom_emb=atom_emb
-                            ),
+                            planner.forward_reagent(z, family_idx=family_idx),
                             pooled,
                         )
 
@@ -445,7 +418,6 @@ def train(
                     loss = (
                         F.cross_entropy(fam_logits_m, fam_t, weight=fam_weights)
                         + loss_reag_weight * F.cross_entropy(oracle_reag, torch.tensor([reag]))
-                        + F.mse_loss(pred_delta.squeeze(0) / scale, delta / scale)
                         + loss_site_weight * _site_loss(site_logits, site_target)
                     )
                     val_loss += float(loss.item())
@@ -516,7 +488,6 @@ def train(
             stale = 0
             best_state = {
                 "planner": copy.deepcopy(planner.state_dict()),
-                "delta": copy.deepcopy(delta_model.state_dict()),
                 "epoch": epoch + 1,
             }
         else:
@@ -531,7 +502,6 @@ def train(
     if best_state is None:
         best_state = {
             "planner": planner.state_dict(),
-            "delta": delta_model.state_dict(),
             "epoch": epochs,
         }
 
@@ -541,9 +511,9 @@ def train(
         "heads": heads,
         "dropout": dropout,
         "encoder": "residual_mp_mean_max",
-        "gap_fuse": "film_attn_concat",
-        "site_head": "local_context_z_gap",
-        "reagent_local": "specific_reaction",
+        "gap_fuse": "film",
+        "site_head": "local_context",
+        "reagent_local": "family_only",
         "vocab": "broad_family_specific_reagent",
         "applicability_mask": True,
         "family_conditioned_reagent": True,
@@ -556,7 +526,6 @@ def train(
         "site_supervision": True,
         "reagent_supervision": True,
         **arch_meta,
-        "delta_scale": [1.0, 1000.0, 10.0, 100.0],
         "planner_gap": "signed_normalized",
         "train_hparams": {
             "lr": lr,
@@ -570,7 +539,7 @@ def train(
         "best_val_family_top1": best_fam_acc,
     }
     torch.save(
-        {"planner": best_state["planner"], "delta": best_state["delta"], "meta": bundle},
+        {"planner": best_state["planner"], "meta": bundle},
         out_dir / "planner.pt",
     )
     (out_dir / "model_card.json").write_text(

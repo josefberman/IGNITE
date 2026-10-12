@@ -8,7 +8,7 @@ import torch
 
 from backend.app.services.modification import LearnedPlannerBundle, ModificationMechanism
 from backend.app.services.reaction_primitives import list_planner_vocab, list_primitives, list_reagents
-from ml.models.architectures import DeltaPropertyPredictor, ModificationPlanner, mol_to_graph
+from ml.models.architectures import ModificationPlanner, mol_to_graph
 
 
 def _write_dummy_checkpoint(path: Path) -> None:
@@ -16,11 +16,9 @@ def _write_dummy_checkpoint(path: Path) -> None:
     families, reagent_rows = list_planner_vocab()
     reagents = [r["reagent_id"] for r in reagent_rows]
     planner = ModificationPlanner(n_families=len(families), n_reagents=len(reagents))
-    delta = DeltaPropertyPredictor()
     torch.save(
         {
             "planner": planner.state_dict(),
-            "delta": delta.state_dict(),
             "meta": {"families": families, "reagents": reagents},
         },
         path / "planner.pt",
@@ -87,7 +85,7 @@ def test_site_loss_trains_site_head():
     opt = torch.optim.Adam(planner.parameters(), lr=1e-2)
     before = planner.site_head.weight.detach().clone()
     z, _, atom_emb = planner.encode(x.unsqueeze(0), torch.zeros(1, 4), edge)
-    logits = planner.forward_sites(atom_emb, z)
+    logits = planner.forward_sites(atom_emb)
     loss = _site_loss(logits, target)
     loss.backward()
     opt.step()

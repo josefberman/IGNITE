@@ -100,7 +100,7 @@ def _run_smarts_on_parent(
 
 
 class LearnedPlannerBundle:
-    """Torch ModificationPlanner (+ optional delta predictor) for family / site / reagent proposals."""
+    """Torch ModificationPlanner for family, site, and reagent proposals."""
 
     def __init__(self, checkpoint_dir: Path | str | None = None):
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
@@ -113,7 +113,6 @@ class LearnedPlannerBundle:
             f: [r["reagent_id"] for r in reagent_rows if r["family_id"] == f] for f in self.family_names
         }
         self._model = None
-        self._delta_model = None
         if self.checkpoint_dir and (self.checkpoint_dir / "planner.pt").exists():
             try:
                 import torch
@@ -123,7 +122,6 @@ class LearnedPlannerBundle:
                     DEFAULT_HEADS,
                     DEFAULT_HIDDEN,
                     DEFAULT_LAYERS,
-                    DeltaPropertyPredictor,
                     ModificationPlanner,
                 )
 
@@ -157,11 +155,6 @@ class LearnedPlannerBundle:
                     group = group_of.get(rid)
                     if group in self.family_to_reagent_ids:
                         self.family_to_reagent_ids[group].append(rid)
-                if "delta" in blob:
-                    delta_model = DeltaPropertyPredictor(**enc_kw)
-                    delta_model.load_state_dict(blob["delta"])
-                    delta_model.eval()
-                    self._delta_model = delta_model
                 self.available = True
                 logger.info(
                     "Loaded learned planner from %s (%d families, %d reagents)",
@@ -173,7 +166,6 @@ class LearnedPlannerBundle:
                 logger.warning("Could not load learned planner: %s", e)
                 self.available = False
                 self._model = None
-                self._delta_model = None
 
     def _encode(self, parent_smiles: str, gap_vector: Sequence[float]):
         if not self.available or self._model is None:
@@ -205,15 +197,14 @@ class LearnedPlannerBundle:
         import torch
 
         with torch.no_grad():
-            gap_t = torch.tensor([list(gap_vector)], dtype=torch.float32)
-            logits = self._model.forward_family(z, gap_t).squeeze(0).clone()
+            logits = self._model.forward_family(z).squeeze(0).clone()
             applicable = set(matching_group_ids(parent_smiles))
             if applicable:
                 for i, name in enumerate(self.family_names):
                     if name not in applicable:
                         logits[i] = -1e9
                 if not bool((logits > -1e8).any()):
-                    logits = self._model.forward_family(z, gap_t).squeeze(0)
+                    logits = self._model.forward_family(z).squeeze(0)
             k_eff = max(1, min(k, int((logits > -1e8).sum().item()), len(self.family_names)))
             if k_eff <= 0:
                 return []
@@ -242,10 +233,7 @@ class LearnedPlannerBundle:
             fam_idx = torch.tensor([self.family_names.index(family_id)])
 
         with torch.no_grad():
-            gap_t = torch.tensor([list(gap_vector)], dtype=torch.float32)
-            logits = self._model.forward_reagent(
-                z, family_idx=fam_idx, gap=gap_t, atom_emb=atom_emb
-            ).squeeze(0).clone()
+            logits = self._model.forward_reagent(z, family_idx=fam_idx).squeeze(0).clone()
             matched = set(matching_reaction_ids(parent_smiles))
             if family_id:
                 allowed = set(self.family_to_reagent_ids.get(family_id, []))
@@ -253,9 +241,7 @@ class LearnedPlannerBundle:
                     if rid not in allowed or (matched and rid not in matched):
                         logits[i] = -1e9
                 if matched and not bool((logits > -1e8).any()):
-                    logits = self._model.forward_reagent(
-                        z, family_idx=fam_idx, gap=gap_t, atom_emb=atom_emb
-                    ).squeeze(0).clone()
+                    logits = self._model.forward_reagent(z, family_idx=fam_idx).squeeze(0).clone()
                     for i, rid in enumerate(self.reagent_names):
                         if rid not in allowed:
                             logits[i] = -1e9
@@ -280,8 +266,7 @@ class LearnedPlannerBundle:
         import torch
 
         with torch.no_grad():
-            gap_t = torch.tensor([list(gap_vector)], dtype=torch.float32)
-            scores = self._model.forward_sites(atom_emb, z, gap_t)
+            scores = self._model.forward_sites(atom_emb)
             m = max(1, min(top_m, scores.numel()))
             return torch.topk(scores, k=m).indices.tolist()
 
@@ -309,60 +294,57 @@ class LearnedPlannerBundle:
             )
         return families, sites, per_family
 
-    def rank_children_by_delta(
-        self,
-        parent_smiles: str,
-        children: Sequence[str],
-        gap_vector: Sequence[float],
-    ) -> List[str]:
-        if not self._delta_model or not children:
-            return list(children)
-        import torch
-
-        from ml.models.architectures import mol_to_graph
-
-        from ml.planner_gap import PROPERTY_SCALES
-
-        parent_g = mol_to_graph(parent_smiles)
-        if parent_g is None:
-            return list(children)
-        px, p_edge = parent_g
-        gap = torch.tensor(list(gap_vector), dtype=torch.float32)
-        # Predictor emits raw property deltas; the planner gap is already
-        # scaled into roughly [-1, 1]. Compare in that same space.
-        delta_scale = torch.tensor(
-            [PROPERTY_SCALES[k] for k in PROPERTY_KEYS],
-            dtype=torch.float32,
-        )
-        scored: List[Tuple[float, str]] = []
-        with torch.no_grad():
-            for smi in children:
-                cg = mol_to_graph(smi)
-                if cg is None:
-                    scored.append((-1e9, smi))
-                    continue
-                cx, c_edge = cg
-                pred = self._delta_model(
-                    px.unsqueeze(0), cx.unsqueeze(0), p_edge, c_edge
-                ).squeeze(0)
-                pred_n = pred / delta_scale
-                if float(gap.norm()) < 1e-8 or float(pred_n.norm()) < 1e-8:
-                    score = -float(pred_n.norm())
-                else:
-                    score = float(torch.nn.functional.cosine_similarity(pred_n, gap, dim=0))
-                scored.append((score, smi))
-        scored.sort(key=lambda t: -t[0])
-        return [s for _, s in scored]
 
 
 class ModificationMechanism:
     """Diagram-aligned modification: plan → execute → validity filter."""
 
-    def __init__(self, checkpoint_dir: Path | str | None = None, rng: Optional[random.Random] = None):
+    def __init__(
+        self,
+        checkpoint_dir: Path | str | None = None,
+        rng: Optional[random.Random] = None,
+        property_predictor=None,
+    ):
         self.rule = StrategyPoolModifier()
         self.learned = LearnedPlannerBundle(checkpoint_dir)
+        self.property_predictor = property_predictor
         self.rng = rng or random.Random(42)
         self._prims = _primitives_by_family()
+
+    def _rank_children(
+        self,
+        parent_smiles: str,
+        children: Sequence[str],
+        gap_vector: Sequence[float],
+    ) -> List[str]:
+        """Keep products whose XGBoost delta points the same way as the requested gap."""
+        predictor = self.property_predictor
+        if predictor is None or not children:
+            return list(children)
+        parent_pred = predictor.predict(parent_smiles)
+        if not parent_pred:
+            return list(children)
+        from ml.planner_gap import PROPERTY_SCALES
+
+        gap = [float(x) for x in gap_vector]
+        gap_norm = sum(x * x for x in gap) ** 0.5
+        scales = [PROPERTY_SCALES[k] for k in PROPERTY_KEYS]
+        scored: List[Tuple[float, str]] = []
+        for smi in children:
+            child_pred = predictor.predict(smi)
+            if not child_pred:
+                scored.append((-1e9, smi))
+                continue
+            raw = [child_pred[k].value - parent_pred[k].value for k in PROPERTY_KEYS]
+            pred = [raw[i] / scales[i] for i in range(len(scales))]
+            pred_norm = sum(x * x for x in pred) ** 0.5
+            if gap_norm < 1e-8 or pred_norm < 1e-8:
+                score = -pred_norm
+            else:
+                score = sum(a * b for a, b in zip(pred, gap)) / (pred_norm * gap_norm)
+            scored.append((score, smi))
+        scored.sort(key=lambda t: -t[0])
+        return [s for _, s in scored]
 
     def _ordered_variants(
         self,
@@ -490,7 +472,7 @@ class ModificationMechanism:
                         max_products=family_cap,
                     ):
                         raw_children.append((smi, group, reaction_id, smarts))
-            order = self.learned.rank_children_by_delta(
+            order = self._rank_children(
                 parent_smiles, [c[0] for c in raw_children], gap_vec
             )
             by_smi = {c[0]: c for c in raw_children}
