@@ -33,6 +33,7 @@ unchanged when applied.
 
 import logging
 import random
+from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 
 from rdkit import Chem
@@ -361,6 +362,258 @@ _PRIMITIVE_ROWS: List[_PrimitiveRow] = [
      ],
      (-1, 0, -1, +1),
      "Ar–CH3 → Ar–H."),
+
+    # --- Nitration: oxygen-rich and nitroso reagents -------------------------
+    ("nitrate_ester_OH",
+     [
+         ("[OX2H:1]>>[O:1][N+](=O)[O-]", _KLAPOTKE),
+         ("[OH:1]>>[O:1][N+](=O)[O-]", _AGRAWAL),
+         ("[C:2][OH:1]>>[C:2][O:1][N+](=O)[O-]", _KJ),
+     ],
+     (+1, +1, 0, 0),
+     "Alcohol O–H → nitrate ester O–NO2."),
+    ("gem_dinitro",
+     [
+         ("[CX4;H2:1]>>[C:1]([N+](=O)[O-])[N+](=O)[O-]", _KLAPOTKE),
+         ("[CH2;X4:1]>>[C:1]([N+](=O)[O-])[N+](=O)[O-]", _AGRAWAL),
+         ("[CX4;H2;!$(C[c]):1]>>[C:1]([N+](=O)[O-])[N+](=O)[O-]", _KJ),
+     ],
+     (+1, +1, +1, +1),
+     "Aliphatic CH2 → gem-dinitro C(NO2)2."),
+    ("trinitromethyl",
+     [
+         ("[CH3:1]>>[C:1]([N+](=O)[O-])([N+](=O)[O-])[N+](=O)[O-]", _KLAPOTKE),
+         ("[CX4;H3:1]>>[C:1]([N+](=O)[O-])([N+](=O)[O-])[N+](=O)[O-]", _AGRAWAL),
+         ("[c:2][CH3:1]>>[c:2][C:1]([N+](=O)[O-])([N+](=O)[O-])[N+](=O)[O-]", _KJ),
+     ],
+     (+1, +1, 0, +1),
+     "Methyl → trinitromethyl C(NO2)3."),
+    ("nitroso_arom",
+     [
+         ("[cH:1]>>[c:1]N=O", _GROUP_ADD),
+         ("[c;H1:1]>>[c:1]N=O", _AGRAWAL),
+         ("[cH1:1]>>[c:1]N=O", _KLAPOTKE),
+     ],
+     (0, -1, +1, +1),
+     "Aromatic C–H → C–NO (nitroso; less oxygen than nitro)."),
+
+    # --- Oxidation: peroxide, epoxide, aldehyde ------------------------------
+    ("hydroperoxy_CH",
+     [
+         ("[cH:1]>>[c:1]OO", _GROUP_ADD),
+         ("[c;H1:1]>>[c:1]OO", _POLITZER),
+         ("[cH1:1]>>[c:1]OO", _KLAPOTKE),
+     ],
+     (+1, 0, 0, +1),
+     "Aromatic C–H → C–OOH (hydroperoxide)."),
+    ("epoxidize_CC",
+     [
+         ("[CX3;!c:1]=[CX3;!c:2]>>[C:1]1[C:2]O1", _GROUP_ADD),
+         ("[C;!c:1]=[C;!c:2]>>[C:1]1[C:2]O1", _AGRAWAL),
+         ("[CX3;!$(c):1]=[CX3;!$(c):2]>>[C:1]1[C:2]O1", _KLAPOTKE),
+     ],
+     (+1, 0, +1, 0),
+     "Aliphatic C=C → epoxide."),
+    ("formyl_CH",
+     [
+         ("[cH:1]>>[c:1]C=O", _GROUP_ADD),
+         ("[c;H1:1]>>[c:1]C=O", _AGRAWAL),
+         ("[cH1:1]>>[c:1]C=O", _ZHANG_CEC),
+     ],
+     (0, -1, 0, -1),
+     "Aromatic C–H → C–CHO (formyl)."),
+
+    # --- Nitrogen heterocycles ----------------------------------------------
+    ("furazan_CH",
+     [
+         ("[cH:1]>>[c:1]c1nonc1", _PAGORIA),
+         ("[c;H1:1]>>[c:1]c1nonc1", _GAO),
+         ("[cH1:1]>>[c:1]c1nonc1", _KLAPOTKE),
+     ],
+     (+1, +1, +1, +1),
+     "Aromatic C–H → C–furazan (1,2,5-oxadiazole)."),
+    ("furoxan_CH",
+     [
+         ("[cH:1]>>[c:1]c1no[n+]([O-])c1", _PAGORIA),
+         ("[c;H1:1]>>[c:1]c1no[n+]([O-])c1", _GAO),
+         ("[cH1:1]>>[c:1]c1[n+]([O-])onc1", _KLAPOTKE),
+     ],
+     (+1, +1, 0, +1),
+     "Aromatic C–H → C–furoxan (furazan N-oxide)."),
+    ("tetrazine_CH",
+     [
+         ("[cH:1]>>[c:1]c1nncnn1", _CHAVEZ),
+         ("[c;H1:1]>>[c:1]c1nncnn1", _GAO),
+         ("[cH1:1]>>[c:1]c1nncnn1", _KLAPOTKE),
+     ],
+     (0, +1, +1, +1),
+     "Aromatic C–H → C–(1,2,4,5-tetrazine)."),
+    ("oxadiazole_CH",
+     [
+         ("[cH:1]>>[c:1]c1nnco1", _GAO),
+         ("[c;H1:1]>>[c:1]c1nnco1", _PAGORIA),
+         ("[cH1:1]>>[c:1]c1ocnn1", _KLAPOTKE),
+     ],
+     (+1, 0, 0, +1),
+     "Aromatic C–H → C–(1,3,4-oxadiazole)."),
+    ("pyrazole_CH",
+     [
+         ("[cH:1]>>[c:1]c1cc[nH]n1", _KATRITZKY),
+         ("[c;H1:1]>>[c:1]c1cc[nH]n1", _GAO),
+         ("[cH1:1]>>[c:1]c1n[nH]cc1", _KLAPOTKE),
+     ],
+     (0, 0, 0, +1),
+     "Aromatic C–H → C–pyrazole."),
+    ("imidazole_CH",
+     [
+         ("[cH:1]>>[c:1]c1nc[nH]c1", _KATRITZKY),
+         ("[c;H1:1]>>[c:1]c1nc[nH]c1", _GAO),
+         ("[cH1:1]>>[c:1]c1c[nH]cn1", _KLAPOTKE),
+     ],
+     (0, 0, +1, 0),
+     "Aromatic C–H → C–imidazole."),
+    ("triazine_CH",
+     [
+         ("[cH:1]>>[c:1]c1ncncn1", _COBURN),
+         ("[c;H1:1]>>[c:1]c1ncncn1", _PAGORIA),
+         ("[cH1:1]>>[c:1]c1ncncn1", _KLAPOTKE),
+     ],
+     (0, +1, 0, +1),
+     "Aromatic C–H → C–(1,3,5-triazine)."),
+    ("nitrile_to_tetrazole",
+     [
+         ("[C:1]#N>>[c:1]1nnn[nH]1", _KLAPOTKE),
+         ("[CX2:1]#N>>[c:1]1nnn[nH]1", _KATRITZKY),
+         ("[C:1]#N>>[c:1]1[nH]nnn1", _GAO),
+     ],
+     (+1, +1, +1, 0),
+     "Nitrile → 5-substituted tetrazole."),
+
+    # --- Halogenation -------------------------------------------------------
+    ("difluoramino_CH",
+     [
+         ("[cH:1]>>[c:1]N(F)F", _KLAPOTKE),
+         ("[c;H1:1]>>[c:1]N(F)F", _AGRAWAL),
+         ("[cH1:1]>>[c:1]N(F)F", _KJ),
+     ],
+     (+1, +1, +1, 0),
+     "Aromatic C–H → C–NF2 (difluoramino)."),
+    ("fluoro_alkyl",
+     [
+         ("[CX4;!H0;!c:1]>>[C:1]F", _KLAPOTKE),
+         ("[CX4;H1,H2,H3:1]>>[C:1]F", _AGRAWAL),
+         ("[CH2;X4:1]>>[CH1:1]F", _GROUP_ADD),
+     ],
+     (+1, 0, +1, -1),
+     "Aliphatic C–H → C–F."),
+
+    # --- Reduction / hydrogenation ------------------------------------------
+    ("hydrogenate_CC",
+     [
+         ("[CX3;H1:1]=[CX3;H1:2]>>[CH2:1][CH2:2]", _GROUP_ADD),
+         ("[CX3;H2:1]=[CX3:2]>>[CH3:1][CH2:2]", _KLAPOTKE),
+         ("[C;!c:1]=[C;!c:2]>>[C:1][C:2]", _AGRAWAL),
+     ],
+     (0, -1, +1, -1),
+     "Aliphatic C=C → C–C (hydrogenation)."),
+    ("nitro_to_amino",
+     [
+         ("[c:1][N+](=O)[O-]>>[c:1][NH2]", _OLAH_NITRATION),
+         ("[c:1][N+](=O)[O-]>>[c:1]N", _KLAPOTKE),
+         ("[c:1][N+](=O)[O-]>>[cH0:1][NH2]", _ZEMAN),
+     ],
+     (0, -1, -1, +1),
+     "Ar–NO2 → Ar–NH2."),
+    ("azide_to_amino",
+     [
+         ("[c:1]N=[N+]=[N-]>>[c:1][NH2]", _BRASE),
+         ("[c:1]N=[N+]=[N-]>>[c:1]N", _KATRITZKY),
+         ("[c:1]N=[N+]=[N-]>>[cH0:1][NH2]", _KLAPOTKE),
+     ],
+     (-1, 0, +1, -1),
+     "Ar–N3 → Ar–NH2."),
+
+    # --- Nitrogen bases beyond amino / hydrazino / cyano --------------------
+    ("guanidino_CH",
+     [
+         ("[cH:1]>>[c:1]N=C(N)N", _KLAPOTKE),
+         ("[c;H1:1]>>[c:1]N=C(N)N", _KATRITZKY),
+         ("[cH1:1]>>[c:1]NC(=N)N", _GAO),
+     ],
+     (0, +1, 0, +1),
+     "Aromatic C–H → C–guanidine."),
+    ("amide_CH",
+     [
+         ("[cH:1]>>[c:1]C(N)=O", _GROUP_ADD),
+         ("[c;H1:1]>>[c:1]C(N)=O", _AGRAWAL),
+         ("[cH1:1]>>[c:1]C(=O)N", _ZHANG_CEC),
+     ],
+     (0, -1, +1, -1),
+     "Aromatic C–H → C–CONH2 (primary amide)."),
+    ("isocyanate_CH",
+     [
+         ("[cH:1]>>[c:1]N=C=O", _GROUP_ADD),
+         ("[c;H1:1]>>[c:1]N=C=O", _KATRITZKY),
+         ("[cH1:1]>>[c:1]N=C=O", _KLAPOTKE),
+     ],
+     (0, +1, -1, 0),
+     "Aromatic C–H → C–NCO (isocyanate)."),
+
+    # --- Alkylation (performance-diluting carbon) ---------------------------
+    ("methyl_CH",
+     [
+         ("[cH:1]>>[c:1]C", _GROUP_ADD),
+         ("[c;H1:1]>>[c:1]C", _AGRAWAL),
+         ("[cH1:1]>>[c:1]C", _KLAPOTKE),
+     ],
+     (-1, -1, 0, 0),
+     "Aromatic C–H → C–CH3."),
+    ("ethyl_CH",
+     [
+         ("[cH:1]>>[c:1]CC", _GROUP_ADD),
+         ("[c;H1:1]>>[c:1]CC", _AGRAWAL),
+         ("[cH1:1]>>[c:1]CC", _KLAPOTKE),
+     ],
+     (-1, 0, -1, 0),
+     "Aromatic C–H → C–CH2CH3."),
+    ("hydroxymethyl_CH",
+     [
+         ("[cH:1]>>[c:1]CO", _GROUP_ADD),
+         ("[c;H1:1]>>[c:1]CO", _POLITZER),
+         ("[cH1:1]>>[c:1]CO", _ZHANG_CEC),
+     ],
+     (0, -1, 0, -1),
+     "Aromatic C–H → C–CH2OH."),
+
+    # --- Arylation ----------------------------------------------------------
+    ("benzyl_CH",
+     [
+         ("[cH:1]>>[c:1]Cc1ccccc1", _POLITZER_STRUCT),
+         ("[c;H1:1]>>[c:1]Cc1ccccc1", _POLITZER),
+         ("[cH1:1]>>[c:1]Cc1ccccc1", _KLAPOTKE),
+     ],
+     (0, -1, +1, 0),
+     "Aromatic C–H → C–CH2Ph."),
+
+    # --- Unsaturation -------------------------------------------------------
+    ("alkyne_CC",
+     [
+         ("[CX4;H2;!R:1][CX4;H2;!R:2]>>[C:1]#[C:2]", _GROUP_ADD),
+         ("[CX4;H2;!R:1][CX4;H3:2]>>[C:1]#[CH:2]", _KLAPOTKE),
+         ("[CH2;X4;!R:1][CH3:2]>>[C:1]#[CH:2]", _AGRAWAL),
+     ],
+     (0, +1, 0, +1),
+     "Acyclic C–C → C≡C."),
+
+    # --- Aromatization ------------------------------------------------------
+    ("aromatize_diene",
+     [
+         ("[C:1]1=[C:2][CX4:3][C:4]=[C:5][CX4:6]1>>[c:1]1[c:2][c:3][c:4][c:5][c:6]1", _POLITZER),
+         ("[C:1]1=[C:2][C:3]=[C:4][CX4:5][CX4:6]1>>[c:1]1[c:2][c:3][c:4][c:5][c:6]1", _KLAPOTKE),
+         ("[C:1]1[CX4:2][C:3]=[C:4][CX4:5][C:6]=1>>[c:1]1[c:2][c:3][c:4][c:5][c:6]1", _GROUP_ADD),
+     ],
+     (0, +1, 0, -1),
+     "Cyclohexadiene → benzene (aromatization)."),
 ]
 
 
@@ -449,6 +702,35 @@ _PRIORITY = {
     "remove_azide_arom": 30,
     "nitro_to_methyl_arom": 31,
     "nitramine_to_amine": 32,
+    "nitrate_ester_OH": 33,
+    "gem_dinitro": 34,
+    "trinitromethyl": 35,
+    "nitroso_arom": 36,
+    "hydroperoxy_CH": 37,
+    "epoxidize_CC": 38,
+    "formyl_CH": 39,
+    "furazan_CH": 40,
+    "furoxan_CH": 41,
+    "tetrazine_CH": 42,
+    "oxadiazole_CH": 43,
+    "pyrazole_CH": 44,
+    "imidazole_CH": 45,
+    "triazine_CH": 46,
+    "nitrile_to_tetrazole": 47,
+    "difluoramino_CH": 48,
+    "fluoro_alkyl": 49,
+    "hydrogenate_CC": 50,
+    "nitro_to_amino": 51,
+    "azide_to_amino": 52,
+    "guanidino_CH": 53,
+    "amide_CH": 54,
+    "isocyanate_CH": 55,
+    "methyl_CH": 56,
+    "ethyl_CH": 57,
+    "hydroxymethyl_CH": 58,
+    "benzyl_CH": 59,
+    "alkyne_CC": 60,
+    "aromatize_diene": 61,
     "identity": 99,
 }
 
@@ -619,15 +901,87 @@ class StrategyPoolModifier:
         return list(all_mods)[:target_count]
 
 
+# Broad family -> the decision the property gap can make.
+# Reagent -> one specific reaction inside that family. SMARTS spellings of the
+# same reaction stay as apply-time fallbacks; they are not planner classes.
+_REACTION_GROUP: Dict[str, str] = {
+    "nitrate_arom_CH": "nitration",
+    "nitrate_alkyl_CH": "nitration",
+    "nitramine_NH": "nitration",
+    "methyl_to_nitromethyl": "nitration",
+    "halogen_Br_to_nitro": "nitration",
+    "azide_arom": "azidation",
+    "azide_methyl": "azidation",
+    "amino_to_azide": "azidation",
+    "halogen_I_to_azide": "azidation",
+    "tetrazole_CH": "heterocycle",
+    "triazole_CH": "heterocycle",
+    "n_oxide": "oxidation",
+    "amino_to_nitro": "oxidation",
+    "hydroxyl_CH": "oxidation",
+    "methoxy_CH": "oxidation",
+    "carboxyl_CH": "oxidation",
+    "methylester_CH": "oxidation",
+    "fluoro_arom_CH": "halogenation",
+    "trifluoromethyl_CH": "halogenation",
+    "chloro_arom_CH": "halogenation",
+    "bromo_arom_CH": "halogenation",
+    "iodo_arom_CH": "halogenation",
+    "amino_CH": "amination",
+    "hydrazino_CH": "amination",
+    "cyano_CH": "amination",
+    "remove_nitro_arom": "reduction",
+    "remove_bromo_arom": "reduction",
+    "remove_azide_arom": "reduction",
+    "nitro_to_methyl_arom": "reduction",
+    "nitramine_to_amine": "reduction",
+    "methyl_to_H": "reduction",
+    "dehydrogenate_CC": "dehydrogenation",
+    "alkyne_CC": "dehydrogenation",
+    "add_phenyl_CH": "arylation",
+    "benzyl_CH": "arylation",
+    "nitrate_ester_OH": "nitration",
+    "gem_dinitro": "nitration",
+    "trinitromethyl": "nitration",
+    "nitroso_arom": "nitration",
+    "hydroperoxy_CH": "oxidation",
+    "epoxidize_CC": "oxidation",
+    "formyl_CH": "oxidation",
+    "furazan_CH": "heterocycle",
+    "furoxan_CH": "heterocycle",
+    "tetrazine_CH": "heterocycle",
+    "oxadiazole_CH": "heterocycle",
+    "pyrazole_CH": "heterocycle",
+    "imidazole_CH": "heterocycle",
+    "triazine_CH": "heterocycle",
+    "nitrile_to_tetrazole": "heterocycle",
+    "difluoramino_CH": "halogenation",
+    "fluoro_alkyl": "halogenation",
+    "hydrogenate_CC": "reduction",
+    "nitro_to_amino": "reduction",
+    "azide_to_amino": "reduction",
+    "guanidino_CH": "amination",
+    "amide_CH": "amination",
+    "isocyanate_CH": "amination",
+    "methyl_CH": "alkylation",
+    "ethyl_CH": "alkylation",
+    "hydroxymethyl_CH": "alkylation",
+    "aromatize_diene": "aromatization",
+}
+
+
 def list_primitives() -> List[dict]:
-    """Export primitive metadata for training / learned planner vocab."""
+    """Export primitive metadata. ``family_id`` is the specific reaction."""
     out = []
     for name, variants, delta, desc in _PRIMITIVE_ROWS:
         smarts_list = [s for s, _src in variants if s]
         reagent_ids = [f"{name}__v{i}" for i in range(len(smarts_list))]
+        if name != "identity" and name not in _REACTION_GROUP:
+            raise KeyError(f"reaction {name} has no broad family in _REACTION_GROUP")
         out.append(
             {
                 "family_id": name,
+                "group": _REACTION_GROUP.get(name, "identity"),
                 "delta": delta,
                 "description": desc,
                 "smarts_variants": smarts_list,
@@ -636,6 +990,51 @@ def list_primitives() -> List[dict]:
             }
         )
     return out
+
+
+def list_planner_vocab() -> Tuple[List[str], List[dict]]:
+    """Broad families, and one reagent per specific reaction inside them.
+
+    Halogenation's reagents are F / CF3 / Cl / Br / I, which move the four
+    properties differently. Nitration's reagents are aromatic nitration,
+    aliphatic nitration, nitramine, and so on. SMARTS spelling variants are
+    not classes.
+    """
+    groups: List[str] = []
+    reagents: List[dict] = []
+    for prim in list_primitives():
+        if prim["family_id"] == "identity":
+            continue
+        if prim["group"] not in groups:
+            groups.append(prim["group"])
+        reagents.append(
+            {
+                "reagent_id": prim["family_id"],
+                "family_id": prim["group"],
+                "delta": prim["delta"],
+                "description": prim["description"],
+            }
+        )
+    return groups, reagents
+
+
+def planner_labels(reaction_family: str, reagent_id: Optional[str] = None) -> Tuple[str, str]:
+    """Map a pairs row onto (broad family, specific reaction).
+
+    Older CSVs store the specific reaction in ``reaction_family`` and a SMARTS
+    spelling (``name__v0``) in ``reagent_id``. Newer rows store the broad
+    family and the specific reaction directly.
+    """
+    raw = str(reaction_family)
+    reag = "" if reagent_id is None else str(reagent_id)
+    if reag.endswith(".0"):
+        reag = reag[:-2]
+    specific = reag.rsplit("__v", 1)[0] if "__v" in reag else reag
+    if raw in _REACTION_GROUP:
+        return _REACTION_GROUP[raw], raw
+    if specific in _REACTION_GROUP:
+        return raw, specific
+    return raw, specific or raw
 
 
 def list_reagents() -> List[dict]:
@@ -655,6 +1054,80 @@ def list_reagents() -> List[dict]:
                 }
             )
     return out
+
+
+_REAGENT_TEMPLATES: Optional[Dict[str, Chem.Mol]] = None
+_REAGENT_REACTIONS: List = []
+
+
+def reagent_templates() -> Dict[str, Chem.Mol]:
+    """Reactant SMARTS templates keyed by reagent_id. Compiled once.
+
+    Templates are copied off the reaction object. RDKit reactant templates are
+    owned by the reaction; dropping the reaction and matching later segfaults.
+    """
+    global _REAGENT_TEMPLATES
+    if _REAGENT_TEMPLATES is None:
+        compiled: Dict[str, Chem.Mol] = {}
+        for reagent in list_reagents():
+            rxn = AllChem.ReactionFromSmarts(reagent["smarts"])
+            if rxn is None or rxn.GetNumReactantTemplates() < 1:
+                continue
+            _REAGENT_REACTIONS.append(rxn)
+            tmpl = rxn.GetReactantTemplate(0)
+            if tmpl is None:
+                continue
+            compiled[reagent["reagent_id"]] = Chem.Mol(tmpl)
+        _REAGENT_TEMPLATES = compiled
+    return _REAGENT_TEMPLATES
+
+
+@lru_cache(maxsize=8192)
+def matching_reagent_ids(smiles: str) -> Tuple[str, ...]:
+    """Reagent ids whose reactant template matches this parent.
+
+    Used to mask family/reagent heads to chemistry that can actually run.
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return ()
+    hits: List[str] = []
+    for reagent_id, tmpl in reagent_templates().items():
+        try:
+            if mol.HasSubstructMatch(tmpl):
+                hits.append(reagent_id)
+        except Exception:
+            continue
+    return tuple(hits)
+
+
+def matching_family_ids(smiles: str) -> Tuple[str, ...]:
+    """Specific reaction names that have a matching SMARTS template."""
+    families = []
+    seen = set()
+    for reagent_id in matching_reagent_ids(smiles):
+        family_id = reagent_id.rsplit("__v", 1)[0]
+        if family_id not in seen:
+            seen.add(family_id)
+            families.append(family_id)
+    return tuple(families)
+
+
+def matching_reaction_ids(smiles: str) -> Tuple[str, ...]:
+    """Planner reagent ids: specific reactions applicable to this parent."""
+    return matching_family_ids(smiles)
+
+
+def matching_group_ids(smiles: str) -> Tuple[str, ...]:
+    """Planner family ids: broad families with at least one applicable reaction."""
+    groups = []
+    seen = set()
+    for reaction_id in matching_reaction_ids(smiles):
+        group = _REACTION_GROUP.get(reaction_id)
+        if group and group not in seen:
+            seen.add(group)
+            groups.append(group)
+    return tuple(groups)
 
 
 def reagent_id_for_smarts(family_id: str, smarts: str) -> Optional[str]:

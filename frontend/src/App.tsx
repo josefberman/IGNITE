@@ -583,8 +583,8 @@ export default function App() {
               <h2>Reaction tree</h2>
             </header>
             <p className="prose">
-              Each column is one modification generation. Depth controls iteration count, not guaranteed
-              columns — later rounds may add no new structures once edits are exhausted.
+              Each column is one modification generation. Later rounds edit molecules already in the
+              tree again, with the next unused family and reagent, and hang the new molecule underneath.
               {result.beam_tree.max_generation != null && result.beam_tree.iterations_completed != null ? (
                 <>
                   {" "}

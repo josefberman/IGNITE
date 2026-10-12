@@ -23,8 +23,8 @@ Maps every architecture-diagram box to an owned IGNITE module.
 
 | Diagram box | Module |
 |-------------|--------|
-| Parent Molecule Encoder | [`ml/models/architectures.py`](../../ml/models/architectures.py) `GraphTransformerEncoder` |
-| Target Delta Encoder | `TargetDeltaEncoder` |
+| Parent Molecule Encoder | [`ml/models/architectures.py`](../../ml/models/architectures.py) `GraphEncoder` (bond MP + mean pool) |
+| Target gap injection | `ModificationPlanner.fuse` — concat raw 4-d gap with `parent_z` |
 | Reaction Family / Site / Reagent selectors | `ModificationPlanner` (+ rule fallback in `ModificationMechanism`) |
 | Reaction Executor | RDKit SMARTS in `reaction_primitives.py` / `modification.py` |
 | Chemical Validity Filter | [`chemistry.py`](../../backend/app/services/chemistry.py) `validate_molecule` |

@@ -9,13 +9,13 @@ import random
 from pathlib import Path
 
 import pandas as pd
-from rdkit import Chem
+from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem
 from rdkit.Chem.Scaffolds import MurckoScaffold
 
 from backend.app.services.chemistry import canonicalize, edit_distance_proxy, validate_molecule
 from backend.app.services.prediction import PropertyPredictor
-from backend.app.services.reaction_primitives import list_primitives, reagent_id_for_smarts
+from backend.app.services.reaction_primitives import list_primitives
 from backend.app.services.safety import estimate_safety
 from backend.app.domain.models import PROPERTY_KEYS
 
@@ -57,7 +57,18 @@ def reacting_atom_indices(mol: Chem.Mol, rxn, product_index: int) -> list[int]:
         return []
 
 
-def generate(seed_csv: Path, models_dir: Path, out_dir: Path, max_parents: int = 500, max_per_parent: int = 5, seed: int = 42):
+def generate(
+    seed_csv: Path,
+    models_dir: Path,
+    out_dir: Path,
+    max_parents: int = 500,
+    max_per_parent: int = 24,
+    max_per_family: int = 2,
+    seed: int = 42,
+):
+    # SMARTS often proposes pentavalent carbon. Those products are rejected
+    # and counted in failures.json; RDKit would otherwise print each one.
+    RDLogger.DisableLog("rdApp.*")
     out_dir.mkdir(parents=True, exist_ok=True)
     rng = random.Random(seed)
     df = pd.read_csv(seed_csv)
@@ -73,7 +84,7 @@ def generate(seed_csv: Path, models_dir: Path, out_dir: Path, max_parents: int =
     failures = []
     n_with_sites = 0
 
-    for parent in smiles_list:
+    for parent_i, parent in enumerate(smiles_list, start=1):
         parent_props = predictor.predict(parent)
         if not parent_props:
             continue
@@ -85,8 +96,12 @@ def generate(seed_csv: Path, models_dir: Path, out_dir: Path, max_parents: int =
         for prim in primitives:
             if produced >= max_per_parent:
                 break
-            for smarts in prim["smarts_variants"]:
-                if produced >= max_per_parent:
+            fam_count = 0
+            variants = list(prim["smarts_variants"])
+            rng.shuffle(variants)
+            seen_sites: set[tuple] = set()
+            for smarts in variants:
+                if produced >= max_per_parent or fam_count >= max_per_family:
                     break
                 try:
                     rxn = AllChem.ReactionFromSmarts(smarts)
@@ -94,7 +109,12 @@ def generate(seed_csv: Path, models_dir: Path, out_dir: Path, max_parents: int =
                         continue
                     product_sets = rxn.RunReactants((mol,))
                     for pi, product_tuple in enumerate(product_sets):
+                        if produced >= max_per_parent or fam_count >= max_per_family:
+                            break
                         sites = reacting_atom_indices(mol, rxn, pi)
+                        site_key = tuple(sites) if sites else ("none", smarts, pi)
+                        if site_key in seen_sites:
+                            continue
                         for product in product_tuple:
                             try:
                                 Chem.SanitizeMol(product)
@@ -115,15 +135,12 @@ def generate(seed_csv: Path, models_dir: Path, out_dir: Path, max_parents: int =
                             safety = estimate_safety(child)
                             if sites:
                                 n_with_sites += 1
-                            reagent_id = reagent_id_for_smarts(prim["family_id"], smarts) or (
-                                f"{prim['family_id']}__v0"
-                            )
                             row = {
                                 "parent_smiles": parent,
                                 "child_smiles": child,
                                 "scaffold": scaffold_of(parent),
-                                "reaction_family": prim["family_id"],
-                                "reagent_id": reagent_id,
+                                "reaction_family": prim["group"],
+                                "reagent_id": prim["family_id"],
                                 "smarts": smarts,
                                 "site_atom_indices": json.dumps(sites),
                                 "edit_distance": edit_distance_proxy(parent, child),
@@ -136,13 +153,17 @@ def generate(seed_csv: Path, models_dir: Path, out_dir: Path, max_parents: int =
                                 row[f"child_{k}"] = child_props[k].value
                                 row[f"delta_{k}"] = child_props[k].value - parent_props[k].value
                             rows.append(row)
+                            seen_sites.add(site_key)
                             produced += 1
-                            if produced >= max_per_parent:
-                                break
-                        if produced >= max_per_parent:
+                            fam_count += 1
                             break
                 except Exception as e:
                     failures.append({"parent": parent, "smarts": smarts, "error": str(e)})
+        if parent_i % 25 == 0 or parent_i == len(smiles_list):
+            print(
+                f"parents {parent_i}/{len(smiles_list)} pairs {len(rows)}",
+                flush=True,
+            )
 
     out = pd.DataFrame(rows)
     # Scaffold split
@@ -169,6 +190,8 @@ def generate(seed_csv: Path, models_dir: Path, out_dir: Path, max_parents: int =
         "n_with_site_labels": int(n_with_sites),
         "n_failures": len(failures),
         "max_parents": max_parents,
+        "max_per_parent": max_per_parent,
+        "max_per_family": max_per_family,
         "seed": seed,
         "label_types": ["weak_xgb_delta", "reacting_atom_sites", "reagent_variant"],
         "sha256": hashlib.sha256(csv_path.read_bytes()).hexdigest(),
@@ -184,7 +207,17 @@ if __name__ == "__main__":
     ap.add_argument("--seed-csv", type=Path, default=Path("sample_start_molecules.csv"))
     ap.add_argument("--models-dir", type=Path, default=Path("models"))
     ap.add_argument("--out-dir", type=Path, default=Path("data/processed"))
-    ap.add_argument("--max-parents", type=int, default=200)
-    ap.add_argument("--max-per-parent", type=int, default=3)
+    ap.add_argument("--max-parents", type=int, default=500)
+    ap.add_argument("--max-per-parent", type=int, default=24)
+    ap.add_argument("--max-per-family", type=int, default=2)
+    ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
-    generate(args.seed_csv, args.models_dir, args.out_dir, args.max_parents, args.max_per_parent)
+    generate(
+        args.seed_csv,
+        args.models_dir,
+        args.out_dir,
+        args.max_parents,
+        args.max_per_parent,
+        args.max_per_family,
+        args.seed,
+    )

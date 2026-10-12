@@ -7,14 +7,14 @@ from pathlib import Path
 import torch
 
 from backend.app.services.modification import LearnedPlannerBundle, ModificationMechanism
-from backend.app.services.reaction_primitives import list_primitives, list_reagents
+from backend.app.services.reaction_primitives import list_planner_vocab, list_primitives, list_reagents
 from ml.models.architectures import DeltaPropertyPredictor, ModificationPlanner, mol_to_graph
 
 
 def _write_dummy_checkpoint(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
-    families = [p["family_id"] for p in list_primitives() if p["family_id"] != "identity"]
-    reagents = [r["reagent_id"] for r in list_reagents()]
+    families, reagent_rows = list_planner_vocab()
+    reagents = [r["reagent_id"] for r in reagent_rows]
     planner = ModificationPlanner(n_families=len(families), n_reagents=len(reagents))
     delta = DeltaPropertyPredictor()
     torch.save(
@@ -53,7 +53,7 @@ def test_propose_families_and_reagents(tmp_path: Path):
     assert len(fams) == 3
     reags = bundle.propose_reagents("c1ccccc1N(=O)=O", gap, family_id=fams[0], k=2)
     assert len(reags) >= 1
-    assert all(r.startswith(fams[0] + "__v") for r in reags)
+    assert all(r in bundle.family_to_reagent_ids[fams[0]] for r in reags)
     families, sites, per_fam = bundle.plan("c1ccccc1N(=O)=O", gap, k_families=3, k_reagents=2)
     assert families
     assert sites
@@ -115,8 +115,10 @@ def test_expand_records_reagent_id(tmp_path: Path):
     assert len(out) >= 1
     for _, rec in out:
         assert rec.reagent
+        known = {p["family_id"] for p in list_primitives() if p["family_id"] != "identity"}
+        assert rec.reagent in known
         if rec.planner == "learned":
-            assert "__v" in rec.reagent or rec.reagent == rec.reaction_family
+            assert rec.reaction_family in {p["group"] for p in list_primitives()}
 
 
 def test_eval_inference_metrics_oracle_vs_predicted_family():

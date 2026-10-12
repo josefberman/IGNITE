@@ -134,6 +134,9 @@ class BeamSearchController:
         beam_nodes = sorted(seed_pool, key=lambda c: c.score.total if c.score else 1e9)[:1]
         best = beam_nodes[0]
         seen = {c.canonical_smiles for c in beam_nodes}
+        catalog = {c.canonical_smiles: c for c in beam_nodes}
+        tried_reagents: dict[str, set[str]] = {c.canonical_smiles: set() for c in beam_nodes}
+        exhausted: set[str] = set()
         rejected = 0
         generated = 0
         source_counts = {"dataset": 0, "literature": 0, "xgboost": 0, "other": 0}
@@ -232,14 +235,40 @@ class BeamSearchController:
                 exploring = True
 
             children: List[CandidateMolecule] = []
+            # Beam parents first, then other molecules already in the tree, deepest
+            # first. Each parent skips reactions it has already used.
+            expand_from: List[CandidateMolecule] = []
+            expand_ids: set[str] = set()
+
+            def _queue(parent: CandidateMolecule) -> None:
+                if parent.id in expand_ids or parent.canonical_smiles in exhausted:
+                    return
+                if parent.generation >= beam.depth:
+                    return
+                expand_ids.add(parent.id)
+                expand_from.append(parent)
+
             for parent in beam_nodes:
+                _queue(parent)
+            parent_budget = max(beam.top_k, 1) * 2
+            for parent in sorted(catalog.values(), key=lambda c: -c.generation):
+                if len(expand_from) >= parent_budget:
+                    break
+                _queue(parent)
+
+            for parent in expand_from:
+                tried = tried_reagents.setdefault(parent.canonical_smiles, set())
+                tried_before = len(tried)
                 expansions = self.modification.expand(
                     parent.canonical_smiles,
                     parent.property_values(),
                     target_dict,
                     n=beam.width,
                     forbidden=seen,
+                    skip_reagents=tried,
                 )
+                if not expansions and len(tried) == tried_before:
+                    exhausted.add(parent.canonical_smiles)
                 for child_smi, mod in expansions:
                     generated += 1
                     if child_smi in seen:
@@ -254,7 +283,7 @@ class BeamSearchController:
                     cand = CandidateMolecule(
                         smiles=child_smi,
                         canonical_smiles=child_smi,
-                        generation=iteration,
+                        generation=parent.generation + 1,
                         parent_id=parent.id,
                         parent_smiles=parent.canonical_smiles,
                         properties=props,
@@ -286,6 +315,8 @@ class BeamSearchController:
                     cand.mape = cand.score.mape
                     seen.add(child_smi)
                     children.append(cand)
+                    catalog[child_smi] = cand
+                    tried_reagents.setdefault(child_smi, set())
                     _register(cand, in_beam=False)
                     _tally(cand)
 

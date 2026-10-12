@@ -1,4 +1,4 @@
-"""Modification planner: learned Graph Transformer heads with rule-based fallback."""
+"""Modification planner: learned graph MP heads with rule-based fallback."""
 
 from __future__ import annotations
 
@@ -14,8 +14,12 @@ from backend.app.domain.models import ModificationRecord, PROPERTY_KEYS
 from backend.app.services.chemistry import edit_distance_proxy, validate_molecule
 from backend.app.services.reaction_primitives import (
     StrategyPoolModifier,
+    list_planner_vocab,
     list_primitives,
     list_reagents,
+    matching_group_ids,
+    matching_reaction_ids,
+    planner_labels,
     reagent_id_for_smarts,
 )
 from ml.planner_gap import planner_input_from_parent_target
@@ -101,11 +105,12 @@ class LearnedPlannerBundle:
     def __init__(self, checkpoint_dir: Path | str | None = None):
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
         self.available = False
-        self.family_names = [p["family_id"] for p in list_primitives() if p["family_id"] != "identity"]
-        self.reagent_names = [r["reagent_id"] for r in list_reagents()]
+        groups, reagent_rows = list_planner_vocab()
+        self.family_names = groups
+        self.reagent_names = [r["reagent_id"] for r in reagent_rows]
         self.reagent_to_smarts = {r["reagent_id"]: r["smarts"] for r in list_reagents()}
         self.family_to_reagent_ids = {
-            f: [r["reagent_id"] for r in list_reagents() if r["family_id"] == f] for f in self.family_names
+            f: [r["reagent_id"] for r in reagent_rows if r["family_id"] == f] for f in self.family_names
         }
         self._model = None
         self._delta_model = None
@@ -142,9 +147,16 @@ class LearnedPlannerBundle:
                 # Keep SMARTS map aligned with checkpoint reagent order when IDs match
                 live = {r["reagent_id"]: r["smarts"] for r in list_reagents()}
                 self.reagent_to_smarts = {rid: live[rid] for rid in reagents if rid in live}
-                self.family_to_reagent_ids = {
-                    f: [rid for rid in reagents if rid.startswith(f + "__v")] for f in families
+                group_of = {
+                    p["family_id"]: p["group"]
+                    for p in list_primitives()
+                    if p["family_id"] != "identity"
                 }
+                self.family_to_reagent_ids = {f: [] for f in families}
+                for rid in reagents:
+                    group = group_of.get(rid)
+                    if group in self.family_to_reagent_ids:
+                        self.family_to_reagent_ids[group].append(rid)
                 if "delta" in blob:
                     delta_model = DeltaPropertyPredictor(**enc_kw)
                     delta_model.load_state_dict(blob["delta"])
@@ -193,8 +205,18 @@ class LearnedPlannerBundle:
         import torch
 
         with torch.no_grad():
-            logits = self._model.forward_family(z).squeeze(0)
-            k_eff = max(1, min(k, logits.numel(), len(self.family_names)))
+            gap_t = torch.tensor([list(gap_vector)], dtype=torch.float32)
+            logits = self._model.forward_family(z, gap_t).squeeze(0).clone()
+            applicable = set(matching_group_ids(parent_smiles))
+            if applicable:
+                for i, name in enumerate(self.family_names):
+                    if name not in applicable:
+                        logits[i] = -1e9
+                if not bool((logits > -1e8).any()):
+                    logits = self._model.forward_family(z, gap_t).squeeze(0)
+            k_eff = max(1, min(k, int((logits > -1e8).sum().item()), len(self.family_names)))
+            if k_eff <= 0:
+                return []
             idx = torch.topk(logits, k=k_eff).indices.tolist()
         return [self.family_names[i] for i in idx if i < len(self.family_names)]
 
@@ -206,10 +228,11 @@ class LearnedPlannerBundle:
         family_id: Optional[str] = None,
         k: int = 3,
         z=None,
+        atom_emb=None,
     ) -> List[str]:
         """Top-k reagent_ids; optionally masked to a single reaction family."""
-        if z is None:
-            _, z, _, _ = self._encode(parent_smiles, gap_vector)
+        if z is None or atom_emb is None:
+            _, z, atom_emb, _ = self._encode(parent_smiles, gap_vector)
         if z is None or self._model is None:
             return []
         import torch
@@ -219,12 +242,23 @@ class LearnedPlannerBundle:
             fam_idx = torch.tensor([self.family_names.index(family_id)])
 
         with torch.no_grad():
-            logits = self._model.forward_reagent(z, family_idx=fam_idx).squeeze(0).clone()
+            gap_t = torch.tensor([list(gap_vector)], dtype=torch.float32)
+            logits = self._model.forward_reagent(
+                z, family_idx=fam_idx, gap=gap_t, atom_emb=atom_emb
+            ).squeeze(0).clone()
+            matched = set(matching_reaction_ids(parent_smiles))
             if family_id:
                 allowed = set(self.family_to_reagent_ids.get(family_id, []))
                 for i, rid in enumerate(self.reagent_names):
-                    if rid not in allowed:
+                    if rid not in allowed or (matched and rid not in matched):
                         logits[i] = -1e9
+                if matched and not bool((logits > -1e8).any()):
+                    logits = self._model.forward_reagent(
+                        z, family_idx=fam_idx, gap=gap_t, atom_emb=atom_emb
+                    ).squeeze(0).clone()
+                    for i, rid in enumerate(self.reagent_names):
+                        if rid not in allowed:
+                            logits[i] = -1e9
             k_eff = max(1, min(k, int((logits > -1e8).sum().item()), len(self.reagent_names)))
             if k_eff <= 0:
                 return list(self.family_to_reagent_ids.get(family_id or "", []))[:k]
@@ -246,7 +280,8 @@ class LearnedPlannerBundle:
         import torch
 
         with torch.no_grad():
-            scores = self._model.forward_sites(atom_emb, z)
+            gap_t = torch.tensor([list(gap_vector)], dtype=torch.float32)
+            scores = self._model.forward_sites(atom_emb, z, gap_t)
             m = max(1, min(top_m, scores.numel()))
             return torch.topk(scores, k=m).indices.tolist()
 
@@ -270,7 +305,7 @@ class LearnedPlannerBundle:
         per_family: Dict[str, List[str]] = {}
         for fam in families:
             per_family[fam] = self.propose_reagents(
-                parent_smiles, gap_vector, family_id=fam, k=k_reagents, z=z
+                parent_smiles, gap_vector, family_id=fam, k=k_reagents, z=z, atom_emb=atom_emb
             )
         return families, sites, per_family
 
@@ -286,11 +321,19 @@ class LearnedPlannerBundle:
 
         from ml.models.architectures import mol_to_graph
 
+        from ml.planner_gap import PROPERTY_SCALES
+
         parent_g = mol_to_graph(parent_smiles)
         if parent_g is None:
             return list(children)
         px, p_edge = parent_g
         gap = torch.tensor(list(gap_vector), dtype=torch.float32)
+        # Predictor emits raw property deltas; the planner gap is already
+        # scaled into roughly [-1, 1]. Compare in that same space.
+        delta_scale = torch.tensor(
+            [PROPERTY_SCALES[k] for k in PROPERTY_KEYS],
+            dtype=torch.float32,
+        )
         scored: List[Tuple[float, str]] = []
         with torch.no_grad():
             for smi in children:
@@ -302,10 +345,11 @@ class LearnedPlannerBundle:
                 pred = self._delta_model(
                     px.unsqueeze(0), cx.unsqueeze(0), p_edge, c_edge
                 ).squeeze(0)
-                if float(gap.norm()) < 1e-8 or float(pred.norm()) < 1e-8:
-                    score = -float(pred.norm())
+                pred_n = pred / delta_scale
+                if float(gap.norm()) < 1e-8 or float(pred_n.norm()) < 1e-8:
+                    score = -float(pred_n.norm())
                 else:
-                    score = float(torch.nn.functional.cosine_similarity(pred, gap, dim=0))
+                    score = float(torch.nn.functional.cosine_similarity(pred_n, gap, dim=0))
                 scored.append((score, smi))
         scored.sort(key=lambda t: -t[0])
         return [s for _, s in scored]
@@ -409,11 +453,15 @@ class ModificationMechanism:
         n: int,
         *,
         forbidden: Optional[set[str]] = None,
+        skip_reagents: Optional[set[str]] = None,
     ) -> List[Tuple[str, ModificationRecord]]:
         gap_disp = _gap_display(parent_props, targets)
         gap_vec = _gap_vector(parent_props, targets)
         products: List[Tuple[str, ModificationRecord]] = []
         seen: set[str] = set(forbidden or ())
+        # Caller keeps this set. Reactions tried here are not proposed again, so
+        # the next call on the same molecule uses the next family and reagent.
+        tried = skip_reagents if skip_reagents is not None else set()
         mol = Chem.MolFromSmiles(parent_smiles)
         rule_target = max(n * 10, n + len(seen))
         family_cap = max(8, n * 3)
@@ -429,16 +477,19 @@ class ModificationMechanism:
                 top_m_sites=8,
             )
             raw_children: List[Tuple[str, str, str, str]] = []  # smi, family, reagent, smarts
-            for fam in families:
-                for smi, reagent_id, smarts in self._apply_family(
-                    parent_smiles,
-                    mol,
-                    fam,
-                    preferred_atoms=sites,
-                    preferred_reagent_ids=reag_by_fam.get(fam),
-                    max_products=family_cap,
-                ):
-                    raw_children.append((smi, fam, reagent_id, smarts))
+            for group in families:
+                for reaction_id in reag_by_fam.get(group, []):
+                    if reaction_id in tried:
+                        continue
+                    tried.add(reaction_id)
+                    for smi, _variant, smarts in self._apply_family(
+                        parent_smiles,
+                        mol,
+                        reaction_id,
+                        preferred_atoms=sites,
+                        max_products=family_cap,
+                    ):
+                        raw_children.append((smi, group, reaction_id, smarts))
             order = self.learned.rank_children_by_delta(
                 parent_smiles, [c[0] for c in raw_children], gap_vec
             )
@@ -461,16 +512,21 @@ class ModificationMechanism:
         # --- Rule-based strategy pool fallback / fill ---
         if len(products) < n:
             strategy = self.rule.get_strategy(gap_disp)
-            fam = strategy.get("primitive", "strategy_pool")
+            specific = strategy.get("primitive", "strategy_pool")
+            if specific in tried:
+                specific = ""
+            else:
+                tried.add(specific)
+            group, _ = planner_labels(specific, specific) if specific else ("", "")
             smarts = (strategy.get("variants") or [{}])[0].get("smarts")
-            for child in self.rule.apply_strategies(
+            for child in ([] if not specific else self.rule.apply_strategies(
                 parent_smiles, gap_disp, target_count=rule_target
-            ):
+            )):
                 if self._accept(
                     parent_smiles,
                     child,
-                    family=fam,
-                    reagent=reagent_id_for_smarts(fam, smarts) if smarts else fam,
+                    family=group,
+                    reagent=specific,
                     smarts=smarts,
                     planner="rule_based",
                     seen=seen,
@@ -486,15 +542,19 @@ class ModificationMechanism:
             for prim in prims:
                 if len(products) >= n:
                     break
-                fam = prim["family_id"]
-                for smi, reagent_id, smarts in self._apply_family(
-                    parent_smiles, mol, fam, max_products=family_cap
+                specific = prim["family_id"]
+                if specific in tried:
+                    continue
+                tried.add(specific)
+                group = prim.get("group", specific)
+                for smi, _variant, smarts in self._apply_family(
+                    parent_smiles, mol, specific, max_products=family_cap
                 ):
                     if self._accept(
                         parent_smiles,
                         smi,
-                        family=fam,
-                        reagent=reagent_id,
+                        family=group,
+                        reagent=specific,
                         smarts=smarts,
                         planner="rule_based",
                         seen=seen,

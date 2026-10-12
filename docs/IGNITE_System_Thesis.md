@@ -583,8 +583,8 @@ External measured reaction / hazard CSVs can be ingested via `ml/data_gen/ingest
 
 `ml/models/architectures.py`:
 
-- `GraphTransformerEncoder` — parent (and child) graph encoding from RDKit atom features  
-- `TargetDeltaEncoder` — numeric property-delta MLP  
+- `GraphEncoder` — parent (and child) graph encoding via stacked bond message-passing + mean pool
+- Gap fuse — raw 4-d signed-normalized target−parent gap concatenated into `ModificationPlanner.fuse`
 - `ModificationPlanner` — hierarchical heads for reaction family, site scores, and reagent (SMARTS variant)
 - `DeltaPropertyPredictor` — multi-task Δy regression
 - Optional `UncertaintyEnsemble` for epistemic spread
