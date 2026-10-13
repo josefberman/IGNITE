@@ -1,0 +1,12 @@
+{
+  "hazard": {
+    "path": "data/processed/hazard_labels.csv",
+    "n": 0,
+    "note": "Empty until licensed hazard CSVs are provided."
+  },
+  "reactions": {
+    "path": "data/processed/measured_reactions.csv",
+    "n": 0,
+    "note": "Measured labels preferred over weak_xgb_delta."
+  }
+}

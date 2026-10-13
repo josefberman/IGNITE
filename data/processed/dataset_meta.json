@@ -1,0 +1,16 @@
+{
+  "n_pairs": 43362,
+  "n_with_site_labels": 42944,
+  "n_failures": 3975,
+  "max_parents": 2000,
+  "max_per_parent": 24,
+  "max_per_family": 2,
+  "seed": 42,
+  "label_types": [
+    "weak_xgb_delta",
+    "reacting_atom_sites",
+    "reagent_variant"
+  ],
+  "sha256": "25ce0a341fcd1eaa465cd846a8060b8201ab27b06f9f1f72cd5afdaecfbfc68b",
+  "license_note": "Synthetic weak labels from local SMARTS + XGBoost; not experimental ground truth."
+}

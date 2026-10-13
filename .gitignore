@@ -6,15 +6,11 @@ venv/
 .env
 node_modules/
 frontend/dist/
-data/processed/
-data/indexes/
-data/ignite.db
 output/
 *.sqlite
 .pytest_cache/
 .mypy_cache/
 .DS_Store
-ml/checkpoints/
 *.pt
 *.ckpt
 frontend/node_modules/
