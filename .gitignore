@@ -11,6 +11,5 @@ output/
 .pytest_cache/
 .mypy_cache/
 .DS_Store
-*.pt
 *.ckpt
 frontend/node_modules/
