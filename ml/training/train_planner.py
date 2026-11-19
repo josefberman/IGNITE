@@ -298,6 +298,9 @@ def train(
     site_layers: int = DEFAULT_SITE_LAYERS,
     bond_types: int = DEFAULT_BOND_TYPES,
     site_reagent: bool = DEFAULT_SITE_REAGENT,
+    split: str = "csv",
+    split_fractions: tuple = (0.7, 0.1, 0.2),
+    split_seed: int = 42,
 ):
     from rdkit import RDLogger
 
@@ -312,6 +315,11 @@ def train(
         raise SystemExit(
             "Dataset missing site_atom_indices; re-run ml.data_gen.generate_pairs before training"
         )
+    if split != "csv":
+        from ml.training.pair_cache import assign_split
+
+        names = pd.Series(["train", "val", "test"])
+        df["split"] = names.iloc[assign_split(df, split, split_fractions, split_seed)].to_numpy()
     families, reagent_rows = list_planner_vocab()
     reagents = [r["reagent_id"] for r in reagent_rows]
     family_to_idx = {f: i for i, f in enumerate(families)}
@@ -651,10 +659,30 @@ def train(
     print(f"Saved checkpoint to {out_dir / 'planner.pt'} (best epoch {best_state['epoch']})", flush=True)
 
 
+def _fractions(text: str) -> tuple:
+    vals = tuple(float(v) for v in text.split(","))
+    if len(vals) != 3 or abs(sum(vals) - 1.0) > 1e-6:
+        raise argparse.ArgumentTypeError("expected three fractions train,val,test summing to 1")
+    return vals
+
+
 if __name__ == "__main__":
+    from ml.models.architectures import (
+        DEFAULT_MT_BRANCH_MP,
+        DEFAULT_MT_CONDITIONING,
+        DEFAULT_MT_SHARED_FC,
+        DEFAULT_MT_SHARED_MP,
+        DEFAULT_MT_TOWER_HIDDEN,
+        DEFAULT_MT_TOWER_LAYERS,
+    )
+
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--arch", choices=("legacy", "multitask"), default="legacy",
+        help="legacy: ModificationPlanner, per-pair loop. multitask: MultitaskPlanner, batched trainer",
+    )
     ap.add_argument("--data", type=Path, default=Path("data/processed/modification_pairs.csv"))
-    ap.add_argument("--out", type=Path, default=Path("ml/checkpoints"))
+    ap.add_argument("--out", type=Path, default=None, help="default ml/checkpoints (legacy), output/multitask (multitask)")
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--patience", type=int, default=7)
     ap.add_argument("--lr", type=float, default=2e-4)
@@ -678,12 +706,86 @@ if __name__ == "__main__":
     ap.add_argument("--label-smoothing", type=float, default=0.0)
     ap.add_argument("--loss-reag-weight", type=float, default=1.0)
     ap.add_argument("--loss-site-weight", type=float, default=1.0)
+    ap.add_argument(
+        "--split", choices=("csv", "random_parent", "random_pair"), default=None,
+        help="csv: the CSV's scaffold split. random_parent: seeded random split by pair fraction, "
+        "each parent molecule in one split. random_pair: seeded random split of pairs. "
+        "Default csv (legacy), random_parent (multitask)",
+    )
+    ap.add_argument("--split-fractions", type=_fractions, default=(0.7, 0.1, 0.2))
+    ap.add_argument("--split-seed", type=int, default=42)
+    mt = ap.add_argument_group("multitask (--arch multitask)")
+    mt.add_argument("--mt-shared-mp", type=int, default=DEFAULT_MT_SHARED_MP,
+                    help="message-passing layers in the shared trunk")
+    mt.add_argument("--mt-branch-mp", type=int, default=DEFAULT_MT_BRANCH_MP,
+                    help="private message-passing layers per task; >0 forks inside the encoder")
+    mt.add_argument("--mt-shared-fc", type=int, default=DEFAULT_MT_SHARED_FC,
+                    help="shared dense layers after the graph vector (only with --mt-branch-mp 0)")
+    mt.add_argument("--mt-tower-layers", type=int, default=DEFAULT_MT_TOWER_LAYERS,
+                    help="hidden layers in each task tower")
+    mt.add_argument("--mt-family-tower", type=int, default=None, help="override --mt-tower-layers for family")
+    mt.add_argument("--mt-reagent-tower", type=int, default=None, help="override --mt-tower-layers for reagent")
+    mt.add_argument("--mt-site-tower", type=int, default=None, help="override --mt-tower-layers for site (>=1)")
+    mt.add_argument("--mt-tower-hidden", type=int, default=DEFAULT_MT_TOWER_HIDDEN, help="tower width")
+    mt.add_argument("--mt-loss-weighting", choices=("fixed", "uncertainty"), default="fixed",
+                    help="fixed: --loss-*-weight. uncertainty: learned per-task weights (Kendall et al.)")
+    mt.add_argument("--mt-conditioning", choices=("hierarchical", "none"), default=DEFAULT_MT_CONDITIONING,
+                    help="hierarchical: reagent tower sees the family and site tower the reagent "
+                    "(ModificationPlanner chain). none: parallel, unconditioned heads after the fork")
+    mt.add_argument("--batch-size", type=int, default=16, help="pairs per optimizer step (legacy: --accum-steps)")
+    mt.add_argument("--max-train", type=int, default=-1, help="subsample the train split (search); -1 = all")
+    mt.add_argument("--max-val", type=int, default=-1, help="subsample the val split (search); -1 = all")
+    mt.add_argument("--eval-test", action="store_true", help="evaluate the best epoch on the test split once")
+    mt.add_argument("--cache", type=Path, default=None, help="featurized pairs cache (.npz); built on first use")
+    mt.add_argument("--cache-workers", type=int, default=8)
+    mt.add_argument("--threads", type=int, default=0, help="torch CPU threads; 0 = torch default")
+    mt.add_argument("--max-hours", type=float, default=0.0, help="stop after this much training time; 0 = no limit")
+    mt.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
     if not args.data.exists():
         raise SystemExit(f"Missing dataset {args.data}; run ml.data_gen.generate_pairs.py first")
+    if args.arch == "multitask":
+        from ml.training.train_multitask import train_multitask
+
+        tl = args.mt_tower_layers
+        train_multitask(
+            args.data,
+            args.out or Path("output/multitask"),
+            epochs=args.epochs,
+            patience=args.patience,
+            lr=args.lr,
+            batch_size=args.batch_size,
+            seed=args.seed,
+            hidden=args.hidden,
+            dropout=args.dropout,
+            bond_types=args.bond_types,
+            site_reagent=not args.no_site_reagent,
+            shared_mp=args.mt_shared_mp,
+            branch_mp=args.mt_branch_mp,
+            shared_fc=args.mt_shared_fc,
+            tower_hidden=args.mt_tower_hidden,
+            family_tower_layers=tl if args.mt_family_tower is None else args.mt_family_tower,
+            reagent_tower_layers=tl if args.mt_reagent_tower is None else args.mt_reagent_tower,
+            site_tower_layers=max(1, tl) if args.mt_site_tower is None else args.mt_site_tower,
+            loss_reag_weight=args.loss_reag_weight,
+            loss_site_weight=args.loss_site_weight,
+            loss_weighting=args.mt_loss_weighting,
+            split=args.split or "random_parent",
+            split_fractions=args.split_fractions,
+            split_seed=args.split_seed,
+            max_train=args.max_train,
+            max_val=args.max_val,
+            eval_test=args.eval_test,
+            cache_path=args.cache,
+            cache_workers=args.cache_workers,
+            threads=args.threads,
+            max_hours=args.max_hours,
+            conditioning=args.mt_conditioning,
+        )
+        raise SystemExit(0)
     train(
         args.data,
-        args.out,
+        args.out or Path("ml/checkpoints"),
         epochs=args.epochs,
         patience=args.patience,
         lr=args.lr,
@@ -701,4 +803,7 @@ if __name__ == "__main__":
         site_layers=args.site_layers,
         bond_types=args.bond_types,
         site_reagent=not args.no_site_reagent,
+        split=args.split or "csv",
+        split_fractions=args.split_fractions,
+        split_seed=args.split_seed,
     )

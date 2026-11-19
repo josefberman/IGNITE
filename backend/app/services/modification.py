@@ -119,42 +119,16 @@ class LearnedPlannerBundle:
                 logger.warning("%s (%s)", self.unavailable_reason, e)
                 return
             try:
-                from ml.models.architectures import (
-                    DEFAULT_DROPOUT,
-                    DEFAULT_HEADS,
-                    DEFAULT_HIDDEN,
-                    DEFAULT_LAYERS,
-                    DEFAULT_REAGENT_LAYERS,
-                    DEFAULT_SITE_LAYERS,
-                    ModificationPlanner,
-                )
+                from ml.models.architectures import build_planner
 
                 blob = torch.load(self.checkpoint_dir / "planner.pt", map_location="cpu", weights_only=False)
                 meta = blob.get("meta", {})
                 families = meta.get("families") or self.family_names
                 reagents = meta.get("reagents") or self.reagent_names
-                hidden = int(meta.get("hidden", DEFAULT_HIDDEN))
-                layers = int(meta.get("layers", DEFAULT_LAYERS))
-                heads = int(meta.get("heads", DEFAULT_HEADS))
-                dropout = float(meta.get("dropout", DEFAULT_DROPOUT))
-                # Checkpoints written before these keys were saved use a linear
-                # family head, untyped bonds, and a reagent-blind site head.
-                family_layers = int(meta["family_layers"]) if "family_layers" in meta else 0
-                reagent_layers = int(meta.get("reagent_layers", DEFAULT_REAGENT_LAYERS))
-                site_layers = int(meta.get("site_layers", DEFAULT_SITE_LAYERS))
-                bond_types = int(meta.get("bond_types", 0))
-                site_reagent = bool(meta.get("site_reagent", False))
-                enc_kw = dict(hidden=hidden, layers=layers, heads=heads, dropout=dropout)
-                model = ModificationPlanner(
-                    n_families=len(families),
-                    n_reagents=len(reagents),
-                    family_layers=family_layers,
-                    reagent_layers=reagent_layers,
-                    site_layers=site_layers,
-                    bond_types=bond_types,
-                    site_reagent=site_reagent,
-                    **enc_kw,
-                )
+                # Legacy or multitask, from the architecture keys saved in the
+                # checkpoint. Older checkpoints without those keys rebuild the
+                # layout they were written with.
+                model = build_planner(meta, len(families), len(reagents))
                 model.load_state_dict(blob["planner"])
                 model.eval()
                 self._model = model

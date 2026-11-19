@@ -334,7 +334,7 @@ Data and trained artifacts: seed CSV and XGBoost models are project assets (see 
 Copy-paste from a fresh clone (Linux/macOS; on Windows use `.venv\Scripts\python`):
 
 ```bash
-git clone https://github.com/josefberman/IGNITE-grokbot.git && cd IGNITE-grokbot
+git clone https://github.com/josefberman/IGNITE.git && cd IGNITE
 uv venv -p 3.11 .venv
 uv pip install -p .venv/bin/python torch --index-url https://download.pytorch.org/whl/cpu
 uv pip install -p .venv/bin/python -e ".[dev,sascore,torch,benchmark]"
