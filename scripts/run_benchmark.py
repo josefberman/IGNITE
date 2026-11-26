@@ -64,12 +64,15 @@ def run_one(
     depth_override=None,
     width_override=None,
     top_k_override=None,
+    planner_dir: Path | None = None,
 ) -> dict:
     os.environ.setdefault("IGNITE_PUBCHEM_ENABLED", "false")
     os.environ.setdefault("IGNITE_OPENALEX_ENABLED", "false")
     from backend.app.domain.models import BeamParameters, ModificationMode, TargetProperties
-    from backend.app.main import _build_controller, _clamp_beam
+    from backend.app.main import _build_controller, _clamp_beam, settings
 
+    if planner_dir is not None:
+        settings.learned_checkpoint_dir = planner_dir
     beam_kw = {**fixed, **combo["beam"]}
     if depth_override:
         beam_kw["depth"] = depth_override
@@ -84,8 +87,26 @@ def run_one(
     rec = controller.last_run_log
     if not rec or not rec.get("best_path"):
         raise RuntimeError("run produced no best_path")
-    rec["benchmark"] = {"combo_id": combo["id"], "beam": beam.model_dump()}
+    rec["benchmark"] = {
+        "combo_id": combo["id"],
+        "beam": beam.model_dump(),
+        "planner": str(planner_dir / "planner.pt") if planner_dir is not None else None,
+        "rule_based": "reagent_effects",
+    }
     return rec
+
+
+def resolve_planner_dir(path: Path) -> Path:
+    """Directory whose ``planner.pt`` the learned mode should load."""
+    path = path.expanduser()
+    path = path.resolve() if path.is_absolute() else (ROOT / path).resolve()
+    if path.is_file():
+        if path.name != "planner.pt":
+            raise SystemExit(f"{path} must be a planner.pt file or the directory that contains one")
+        path = path.parent
+    if not (path / "planner.pt").is_file():
+        raise SystemExit(f"no planner.pt in {path}")
+    return path
 
 
 def main(argv=None) -> int:
@@ -93,7 +114,10 @@ def main(argv=None) -> int:
     ap.add_argument("--config", type=Path, default=None, help="Config path (overrides --suite)")
     ap.add_argument("--suite", choices=sorted(SUITES), default="50", help="Built-in config: 50 (default) or 500")
     ap.add_argument("--log-dir", type=Path, default=None)
-    ap.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
+    ap.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES),
+                    help="planner loads --planner. rule_based ranks reagents by the documented raise/lower/neutral effects")
+    ap.add_argument("--planner", type=Path, default=None,
+                    help="planner.pt, or the directory that contains it. Default: ml/checkpoints")
     ap.add_argument("--limit", type=int, default=None, help="Only the first N combos (smoke test)")
     ap.add_argument("--depth-override", type=int, default=None, help="Force depth for every combo")
     ap.add_argument("--width-override", type=int, default=None, help="Force width for every combo")
@@ -105,7 +129,12 @@ def main(argv=None) -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
     config_path = args.config or SUITES[args.suite]
     cfg = load_config(config_path)
+    planner_dir = resolve_planner_dir(args.planner) if args.planner is not None else None
     print(f"config={config_path}", flush=True)
+    if planner_dir is not None:
+        print(f"planner={planner_dir / 'planner.pt'}", flush=True)
+    if "rule_based" in args.modes:
+        print("rule_based=reagent_effects", flush=True)
     todo, skipped = plan(cfg, log_dir, args.modes, args.limit)
     print(f"log_dir={log_dir} pending={len(todo)} skipped_valid={len(skipped)}", flush=True)
     if args.dry_run:
@@ -120,6 +149,7 @@ def main(argv=None) -> int:
             rec = run_one(
                 combo, mode, cfg.get("fixed_beam", {}),
                 args.depth_override, args.width_override, args.top_k_override,
+                planner_dir,
             )
             rec["benchmark"]["elapsed_s"] = round(time.time() - t0, 2)
             out = log_path(log_dir, combo["id"], mode)

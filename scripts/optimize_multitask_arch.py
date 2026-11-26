@@ -8,7 +8,7 @@ validation split. The test split is never touched here.
 
 Score (higher is better), the one ``train_planner`` early-stops on:
 
-    family top-1 + 0.5 * site top-1 + 0.25 * reagent top-1 given the true family
+    0.25 * family top-1 + site top-1 + reagent top-1 given the true family
 
 Stage 1 varies where the trunk forks and how deep the shared and per-task
 parts are. Stage 2 takes the best stage-1 architecture and varies width and
@@ -73,8 +73,13 @@ def trial_name(c: dict) -> str:
         name += "_unc"
     elif (c.get("lr_w", 1.0), c.get("ls_w", 1.0)) != (1.0, 1.0):
         name += f"_lr{c.get('lr_w', 1.0)}_ls{c.get('ls_w', 1.0)}"
-    if c.get("cond", "hierarchical") == "none":
+    cond = c.get("cond", "hierarchical")
+    if cond == "none":
         name += "_cnone"
+    elif cond == "parallel":
+        name += "_cparallel"
+    elif cond == "cascade":
+        name += "_ccascade"
     if float(c.get("dropout", 0.15)) != 0.15:
         name += f"_d{c['dropout']}"
     if c.get("seed", 42) != 42:
@@ -255,7 +260,7 @@ def write_markdown(rows: list[dict], args) -> None:
         f"(patience {args.patience}) and is scored on the whole validation split at its best epoch. "
         "The test split is not used here.",
         "",
-        "Score = family top-1 + 0.5 site top-1 + 0.25 reagent top-1 given the true family. "
+        "Score = 0.25 family top-1 + site top-1 + reagent top-1 given the true family. "
         "`s` shared message-passing layers, `b` private message-passing layers per task "
         "(fork inside the encoder), `fc` shared dense layers after the graph vector, "
         "`t` hidden layers per task tower, `w` tower width, `h` trunk width. "

@@ -16,7 +16,7 @@ loss averaged over them, so ``--batch-size 16`` here is the same update as its
 default ``--accum-steps 16``. Its per-pair family class weights cancel at batch
 size 1, so the family loss here is unweighted too.
 
-Validation picks the epoch (score = family top-1 + 0.5 site top-1 + 0.25
+Validation picks the epoch (score = 0.25 family top-1 + site top-1 +
 reagent top-1 given the true family, as in the legacy loop). The test split is
 evaluated once, on the best epoch, only with ``--eval-test``.
 """
@@ -44,7 +44,7 @@ NEG = -1e9
 
 
 def selection_score(m: dict) -> float:
-    return m["family_top1"] + 0.5 * m["site_top1"] + 0.25 * m["reagent_oracle_top1"]
+    return 0.25 * m["family_top1"] + m["site_top1"] + m["reagent_oracle_top1"]
 
 
 def _family_mask(b, gold: torch.Tensor) -> torch.Tensor:
@@ -137,12 +137,23 @@ def _forward(model: MultitaskPlanner, b, fam_pool, *, eval_mode: bool):
     z_r, emb_r = enc["reagent"]
     z_s, emb_s = enc["site"]
     fam, reag = b["fam"], b["reag"]
-    fam_logits = model.family_logits(z_f, gap)
+    if model.conditioning == "cascade":
+        fam_h = model.family_hidden(z_f, gap)
+        fam_logits = model.family_out(fam_h)
+        reag_h = model.reagent_hidden(z_r, None, gap, emb_r, b["batch"], b["n"], fam_h=fam_h)
+        reag_logits = model.reagent_out(reag_h)
+        site_logits = model.site_logits(emb_s, z_s, gap, b["batch"], reag_h=reag_h)
+    elif model.conditioning == "parallel":
+        fam_logits = model.family_logits(z_f, gap)
+        reag_logits = model.reagent_logits(z_r, None, gap, emb_r, b["batch"], b["n"])
+        site_logits = model.site_logits(emb_s, z_s, gap, b["batch"])
+    else:
+        fam_logits = model.family_logits(z_f, gap)
+        onehot = F.one_hot(fam, model.n_families).to(z_r.dtype)
+        reag_logits = model.reagent_logits(z_r, onehot, gap, emb_r, b["batch"], b["n"])
+        site_logits = model.site_logits(emb_s, z_s, gap, b["batch"], reag)
     fam_m = _masked(fam_logits, _family_mask(b, fam))
-    onehot = F.one_hot(fam, model.n_families).to(z_r.dtype)
-    reag_logits = model.reagent_logits(z_r, onehot, gap, emb_r, b["batch"], b["n"])
     reag_m = _masked(reag_logits, _reagent_mask(b, fam_pool, fam, reag))
-    site_logits = model.site_logits(emb_s, z_s, gap, b["batch"], reag)
     l_fam = F.cross_entropy(fam_m, fam, reduction="none")
     l_reag = F.cross_entropy(reag_m, reag, reduction="none")
     l_site, site_rank = _site_terms(b, site_logits)
@@ -150,13 +161,22 @@ def _forward(model: MultitaskPlanner, b, fam_pool, *, eval_mode: bool):
     if eval_mode:
         pred_fam = fam_m.argmax(dim=1)
         top3 = fam_m.topk(min(3, fam_m.size(1)), dim=1).indices
-        oh_pred = F.one_hot(pred_fam, model.n_families).to(z_r.dtype)
-        reag_pred_logits = model.reagent_logits(z_r, oh_pred, gap, emb_r, b["batch"], b["n"])
+        if model.conditioning in ("parallel", "cascade"):
+            reag_pred_logits = reag_logits
+        else:
+            oh_pred = F.one_hot(pred_fam, model.n_families).to(z_r.dtype)
+            reag_pred_logits = model.reagent_logits(z_r, oh_pred, gap, emb_r, b["batch"], b["n"])
         gold_if_right = torch.where(pred_fam == fam, reag, torch.full_like(reag, -1))
         pmask = _reagent_mask(b, fam_pool, pred_fam, None)
         right = gold_if_right >= 0
         pmask[right, reag[right]] = True
         pred_reag = _masked(reag_pred_logits, pmask).argmax(dim=1)
+        if model.site_reagent_emb is not None:
+            # Training loss stays on the gold reagent. This rank is the site
+            # given the reagent the model just predicted, matching search.
+            _, site_rank = _site_terms(
+                b, model.site_logits(emb_s, z_s, gap, b["batch"], pred_reag)
+            )
         out.update(
             fam_ok=pred_fam == fam,
             fam3_ok=(top3 == fam.unsqueeze(1)).any(dim=1),
@@ -245,6 +265,9 @@ def train_multitask(
     split: str = "random_parent",
     split_fractions=(0.7, 0.1, 0.2),
     split_seed: int = 42,
+    train_idx: np.ndarray | None = None,
+    val_idx: np.ndarray | None = None,
+    test_idx: np.ndarray | None = None,
     max_train: int = -1,
     max_val: int = -1,
     eval_test: bool = False,
@@ -262,13 +285,20 @@ def train_multitask(
     cache = PairCache(ensure_pair_cache(data_csv, cache_path, cache_workers))
     families, reagents = cache.families, cache.reagents
     fam_pool = torch.from_numpy(cache.fam_pool)
-    codes = cache.split_codes(split, split_fractions, split_seed)
-    all_idx = np.arange(cache.n_pairs)
-    tr_full, va_full, te_idx = all_idx[codes == 0], all_idx[codes == 1], all_idx[codes == 2]
+    if train_idx is not None:
+        tr_full = np.asarray(train_idx)
+        va_full = np.asarray(val_idx) if val_idx is not None else np.array([], dtype=np.int64)
+        te_idx = np.asarray(test_idx) if test_idx is not None else np.array([], dtype=np.int64)
+        split_mode = "explicit"
+    else:
+        codes = cache.split_codes(split, split_fractions, split_seed)
+        all_idx = np.arange(cache.n_pairs)
+        tr_full, va_full, te_idx = all_idx[codes == 0], all_idx[codes == 1], all_idx[codes == 2]
+        split_mode = split
     tr_idx = _subsample(tr_full, max_train, seed)
     va_idx = _subsample(va_full, max_val, seed + 1)
     split_info = {
-        "mode": split,
+        "mode": split_mode,
         "fractions": list(split_fractions),
         "seed": split_seed,
         "n_pairs": int(cache.n_pairs),
@@ -339,40 +369,46 @@ def train_multitask(
                 print(f"  epoch {epoch+1} {n}/{len(order)} loss={tot / max(1, n):.4f} {n / max(1e-9, time.time() - t0):.0f} pairs/s", flush=True)
         scheduler.step()
         train_time = time.time() - t0
-        vm = evaluate(model, cache, va_idx, fam_pool, 256, loss_reag_weight, loss_site_weight)
         rec = {
             "epoch": epoch + 1,
             "train_loss": tot / max(1, n),
             "lr": scheduler.get_last_lr()[0],
             "train_seconds": train_time,
-            **{f"val_{k}": v for k, v in vm.items() if k != "n"},
         }
         if log_vars is not None:
             rec["log_vars"] = [float(v) for v in log_vars.detach()]
-        history.append(rec)
-        print(
-            f"epoch {epoch+1}: train={rec['train_loss']:.4f} val={vm['loss']:.4f} fam={vm['family_top1']:.4f} "
-            f"fam3={vm['family_top3']:.4f} reag={vm['reagent_top1']:.4f} reag_oracle={vm['reagent_oracle_top1']:.4f} "
-            f"site={vm['site_top1']:.4f} site3={vm['site_top3']:.4f} plan={vm['plan_top1']:.4f} "
-            f"score={vm['score']:.4f} ({train_time:.0f}s)",
-            flush=True,
-        )
-        if vm["score"] > best_score + 1e-4:
-            best_score = vm["score"]
-            best = {"state": copy.deepcopy(model.state_dict()), "epoch": epoch + 1, "val": vm}
-            stale = 0
+        if len(va_idx) == 0:
+            history.append(rec)
+            print(f"epoch {epoch+1}: train={rec['train_loss']:.4f} ({train_time:.0f}s)", flush=True)
         else:
-            stale += 1
-            if stale >= patience:
-                print(f"Early stop at epoch {epoch+1} (best score={best_score:.4f})", flush=True)
-                break
+            vm = evaluate(model, cache, va_idx, fam_pool, 256, loss_reag_weight, loss_site_weight)
+            rec.update({f"val_{k}": v for k, v in vm.items() if k != "n"})
+            history.append(rec)
+            print(
+                f"epoch {epoch+1}: train={rec['train_loss']:.4f} val={vm['loss']:.4f} fam={vm['family_top1']:.4f} "
+                f"fam3={vm['family_top3']:.4f} reag={vm['reagent_top1']:.4f} reag_oracle={vm['reagent_oracle_top1']:.4f} "
+                f"site={vm['site_top1']:.4f} site3={vm['site_top3']:.4f} plan={vm['plan_top1']:.4f} "
+                f"score={vm['score']:.4f} ({train_time:.0f}s)",
+                flush=True,
+            )
+            if vm["score"] > best_score + 1e-4:
+                best_score = vm["score"]
+                best = {"state": copy.deepcopy(model.state_dict()), "epoch": epoch + 1, "val": vm}
+                stale = 0
+            else:
+                stale += 1
+                if stale >= patience:
+                    print(f"Early stop at epoch {epoch+1} (best score={best_score:.4f})", flush=True)
+                    break
         if max_hours > 0 and (time.time() - t_start) / 3600 > max_hours:
             print(f"Stopping: time budget {max_hours} h reached", flush=True)
             break
 
+    if best is None:
+        best = {"state": copy.deepcopy(model.state_dict()), "epoch": len(history), "val": {"score": None, "family_top1": None}}
     model.load_state_dict(best["state"])
     test_metrics = None
-    if eval_test:
+    if eval_test and len(te_idx) > 0:
         test_metrics = evaluate(model, cache, te_idx, fam_pool, 256, loss_reag_weight, loss_site_weight)
         print(f"TEST {json.dumps(test_metrics)}", flush=True)
 
@@ -384,7 +420,7 @@ def train_multitask(
         "reagent_local": "family_only",
         "vocab": "broad_family_specific_reagent",
         "applicability_mask": True,
-        "family_conditioned_reagent": model.conditioning == "hierarchical",
+        "family_conditioned_reagent": model.conditioning in ("hierarchical", "cascade"),
     }
     hparams = {
         "lr": lr,

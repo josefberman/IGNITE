@@ -12,11 +12,10 @@ from backend.app.domain.models import (
 )
 
 
-# Final ranking uses MAPE, synthetic accessibility, and minimal-edit only.
+# Final ranking uses MAPE and synthetic accessibility only.
 DEFAULT_WEIGHTS = {
     "mape": 0.65,
     "sascore": 0.25,
-    "minimal_edit": 0.10,
 }
 
 
@@ -51,23 +50,23 @@ def score_candidate(
     explore: bool = False,
 ) -> ScoreBreakdown:
     """
-    Ranking score (lower is better): MAPE + SAScore + minimal-edit.
+    Ranking score (lower is better): MAPE + SAScore.
 
     Hard safety rejection and optional novelty gating happen upstream in beam search.
     Safety / uncertainty / novelty are not reported to clients.
+    ``max_edit`` is unused; edit size is recorded on the modification, not in the score.
     """
+    del max_edit
     w = {**DEFAULT_WEIGHTS, **(weights or {})}
+    w.pop("minimal_edit", None)
     if explore:
-        w = {**w, "mape": 0.85, "sascore": 0.10, "minimal_edit": 0.05}
+        w = {**w, "mape": 0.85, "sascore": 0.10}
 
     props = candidate.property_values()
     mape = calculate_mape(props, target)
     mape_norm = min(mape / 100.0, 1.0)
 
     sas = candidate.safety.score if candidate.safety else 0.5
-    edit = 0.0
-    if candidate.modification:
-        edit = min(1.0, candidate.modification.edit_distance / max(1, max_edit))
 
     # Dataset seeds should not freeze the search while exploring.
     seed_stagnation = 0.0
@@ -79,14 +78,13 @@ def score_candidate(
     total = (
         w["mape"] * mape_norm
         + w["sascore"] * sas
-        + w["minimal_edit"] * edit
         + seed_stagnation
     )
     return ScoreBreakdown(
         mape=mape,
         mape_normalized=mape_norm,
         sascore_penalty=sas,
-        minimal_edit_penalty=edit,
+        minimal_edit_penalty=0.0,
         total=total,
         weights=w,
     )

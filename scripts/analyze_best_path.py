@@ -5,7 +5,7 @@
 depth=20 (logs under ``logs/benchmark_w2_k1_d20``), then plots those logs.
 
 Score direction: ``overall.score`` is ``ScoreBreakdown.total`` (MAPE + SAScore
-penalty + minimal-edit penalty) and the beam search ranks ascending, so
+penalty) and the beam search ranks ascending, so
 LOWER IS BETTER. ``fit.mape_normalized`` is the logged MAPE term (MAPE/100,
 capped at 1) and is also lower-is-better. The y-axes are labelled accordingly.
 

@@ -51,6 +51,37 @@ def random_group_split(groups: np.ndarray, fractions=(0.7, 0.1, 0.2), seed: int 
     return code_of_group[inv]
 
 
+def holdout_and_kfold(
+    groups: np.ndarray, *, test_frac: float = 0.2, n_folds: int = 10, seed: int = 42
+) -> tuple:
+    """Parent-grouped 20% holdout plus k folds on the rest.
+
+    Returns ``(test_mask, fold_id)``. ``fold_id`` is ``-1`` on holdout rows and
+    ``0 .. n_folds-1`` on the rest. Each group is in exactly one piece.
+    """
+    if not 0.0 < test_frac < 1.0:
+        raise ValueError(f"test_frac must be in (0, 1), got {test_frac}")
+    if n_folds < 2:
+        raise ValueError(f"n_folds must be >= 2, got {n_folds}")
+    groups = np.asarray(groups)
+    test_mask = random_group_split(groups, (1.0 - test_frac, 0.0, test_frac), seed) == 2
+    fold_id = np.full(len(groups), -1, dtype=np.int8)
+    rest = ~test_mask
+    if not bool(rest.any()):
+        return test_mask, fold_id
+    rest_groups = groups[rest]
+    uniq, inv, counts = np.unique(rest_groups, return_inverse=True, return_counts=True)
+    order = np.random.default_rng(seed + 1).permutation(len(uniq))
+    fold_size = np.zeros(n_folds, dtype=np.int64)
+    fold_of = np.zeros(len(uniq), dtype=np.int8)
+    for i in order:
+        f = int(np.argmin(fold_size))
+        fold_of[i] = f
+        fold_size[f] += counts[i]
+    fold_id[rest] = fold_of[inv]
+    return test_mask, fold_id
+
+
 def assign_split(df: pd.DataFrame, mode: str, fractions=(0.7, 0.1, 0.2), seed: int = 42) -> np.ndarray:
     """Split codes per row. ``csv`` keeps the CSV's ``split`` column (scaffold split)."""
     if mode == "csv":

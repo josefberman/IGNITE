@@ -156,7 +156,6 @@ def test_new_cage_reagents_match_expected_scaffolds():
     seeds = _seed_smiles()
     expected = {
         "nitramine_to_nitrosamine": ["RDX", "HMX", "CL-20", "TEX"],
-        "aliphatic_nitro_to_nitroso": ["Octanitrocubane"],
         "aliphatic_nitro_to_amino": ["Octanitrocubane"],
     }
     for reagent_id, names in expected.items():

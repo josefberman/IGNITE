@@ -11,7 +11,7 @@ Every trial trains on the same subsample of the train split and is scored on
 the same subsample of the val split. The score is the one ``train_planner``
 uses for early stopping:
 
-    family top-1 + 0.5 * site top-1 + 0.25 * reagent top-1 given the true family
+    0.25 * family top-1 + site top-1 + reagent top-1 given the true family
 
 Higher is better. Checkpoints go under ``--out`` and are not copied over
 ``ml/checkpoints/planner.pt``.
@@ -49,9 +49,9 @@ def parse_nonneg_ints(text: str) -> tuple[int, ...]:
 
 def selection_score(row: dict) -> float:
     return (
-        float(row["val_family_top1"])
-        + 0.5 * float(row["val_site_top1"])
-        + 0.25 * float(row["val_reagent_oracle_top1"])
+        0.25 * float(row["val_family_top1"])
+        + float(row["val_site_top1"])
+        + float(row["val_reagent_oracle_top1"])
     )
 
 

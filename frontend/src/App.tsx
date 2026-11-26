@@ -142,13 +142,9 @@ function ScoringReference() {
         <pre>MAPE% = average_i( |pred_i − target_i| / |target_i| × 100 )</pre>
         <h3>Synthetic accessibility — weight 0.25</h3>
         <p>RDKit SAScore mapped to [0, 1]. Lower synthesis difficulty means less penalty.</p>
-        <h3>Minimal edit — weight 0.10</h3>
-        <p>
-          Prefers simpler modifications: <code>edit = min(1, atom_count_delta / 10)</code>
-        </p>
         <h3>Combined total</h3>
         <pre>
-          {`total = 0.65 × mape_norm + 0.25 × sascore + 0.10 × edit`}
+          {`total = 0.65 × mape_norm + 0.25 × sascore`}
         </pre>
       </div>
     </details>
@@ -349,8 +345,8 @@ function MoleculeCard({
           </div>
           {mol.score && (
             <p className="score-detail">
-              MAPE {mol.score.mape.toFixed(2)}% · SA {mol.score.sascore_penalty.toFixed(3)} · edit{" "}
-              {mol.score.minimal_edit_penalty.toFixed(3)} · <strong>total {mol.score.total.toFixed(3)}</strong>
+              MAPE {mol.score.mape.toFixed(2)}% · SA {mol.score.sascore_penalty.toFixed(3)} ·{" "}
+              <strong>total {mol.score.total.toFixed(3)}</strong>
             </p>
           )}
         </div>

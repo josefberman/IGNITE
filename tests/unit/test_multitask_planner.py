@@ -67,6 +67,9 @@ def test_baseline_config_reproduces_legacy_planner(site_reagent):
         dict(shared_mp=2, shared_fc=2, family_tower_layers=2, reagent_tower_layers=2, site_tower_layers=2),
         dict(shared_mp=1, branch_mp=2, tower_hidden=64),
         dict(shared_mp=0, branch_mp=1, family_tower_layers=0),
+        dict(shared_mp=3, shared_fc=2, conditioning="parallel"),
+        dict(shared_mp=3, shared_fc=2, conditioning="cascade"),
+        dict(shared_mp=3, shared_fc=0, conditioning="cascade"),
     ],
 )
 def test_fork_configs_shapes_and_meta_roundtrip(cfg):
@@ -255,6 +258,53 @@ def test_train_multitask_smoke_writes_loadable_checkpoint(tmp_path: Path, tiny_c
     assert bundle.available and isinstance(bundle._model, MultitaskPlanner)
 
 
+def test_train_cascade_and_parallel_smoke(tmp_path: Path, tiny_cache):
+    from ml.training.train_multitask import train_multitask
+
+    common = dict(
+        epochs=1, patience=1, batch_size=8, hidden=32, dropout=0.1, bond_types=5,
+        site_reagent=True, shared_mp=2, branch_mp=0, tower_hidden=32,
+        family_tower_layers=1, reagent_tower_layers=1, site_tower_layers=1,
+        split="random_pair", eval_test=True, cache_workers=1, threads=1,
+    )
+    for cond, fc in (("parallel", 2), ("cascade", 2), ("cascade", 0)):
+        out = tmp_path / f"{cond}_{fc}"
+        card = train_multitask(
+            FIXTURE, out, shared_fc=fc, conditioning=cond, cache_path=tmp_path / "c.npz", **common
+        )
+        assert card["mt_conditioning"] == cond
+        assert card["mt_shared_fc"] == fc
+        blob = torch.load(out / "planner.pt", map_location="cpu", weights_only=False)
+        assert blob["meta"]["mt_conditioning"] == cond
+
+
+def test_arch_train_writes_seeded_80_10_10_checkpoint(tmp_path: Path, tiny_cache):
+    import json
+
+    from ml.training.cv_train import main
+
+    out = tmp_path / "arch1"
+    rc = main(
+        [
+            "--data", str(FIXTURE), "--out", str(out), "--cache", str(tmp_path / "c.npz"),
+            "--epochs", "1", "--patience", "1", "--batch-size", "8", "--hidden", "32",
+            "--dropout", "0.1", "--bond-types", "5", "--shared-mp", "2",
+            "--tower-hidden", "32", "--seed", "0", "--cache-workers", "1", "--threads", "1",
+        ],
+        shared_fc=2,
+        conditioning="parallel",
+        out=out,
+    )
+    assert rc == 0
+    assert (out / "planner.pt").exists()
+    card = json.loads((out / "model_card.json").read_text())
+    assert card["split"]["mode"] == "random_parent"
+    assert card["split"]["fractions"] == [0.8, 0.1, 0.1]
+    assert card["split"]["seed"] == 0
+    assert card["train_hparams"]["seed"] == 0
+    assert card["mt_conditioning"] == "parallel"
+
+
 def test_unconditioned_heads_ignore_family_and_reagent():
     model = MultitaskPlanner(11, 65, shared_mp=1, conditioning="none").eval()
     assert model.site_reagent is False and model.site_reagent_emb is None
@@ -272,6 +322,109 @@ def test_unconditioned_heads_ignore_family_and_reagent():
     rebuilt.load_state_dict(model.state_dict())
     with pytest.raises(ValueError):
         MultitaskPlanner(11, 65, conditioning="bogus")
+
+
+def test_parallel_heads_ignore_family_and_reagent():
+    model = MultitaskPlanner(11, 65, shared_mp=3, shared_fc=2, conditioning="parallel").eval()
+    assert model.site_reagent is False and model.site_reagent_emb is None
+    x, gap, edge = _inputs()
+    z, _, atom_emb = model.encode(x, gap, edge)
+    r0 = model.forward_reagent(z, family_idx=torch.tensor([0]), gap=gap, atom_emb=atom_emb)
+    r1 = model.forward_reagent(z, family_idx=torch.tensor([4]), gap=gap, atom_emb=atom_emb)
+    r2 = model.forward_reagent(z, gap=gap, atom_emb=atom_emb)
+    assert torch.equal(r0, r1) and torch.equal(r0, r2)
+    s0 = model.forward_sites(atom_emb, z, gap, reagent_idx=torch.tensor([1]))
+    s1 = model.forward_sites(atom_emb, z, gap, reagent_idx=torch.tensor([9]))
+    assert torch.equal(s0, s1)
+    rebuilt = build_planner(model.arch_meta(), 11, 65)
+    assert rebuilt.conditioning == "parallel"
+    rebuilt.load_state_dict(model.state_dict())
+    rebuilt.eval()
+    z_r, _, a_r = rebuilt.encode(x, gap, edge)
+    assert torch.allclose(rebuilt.forward_family(z_r, gap), model.forward_family(z, gap))
+
+
+def test_cascade_hidden_roundtrip_and_gradients():
+    nf, nr = 11, 65
+    model = MultitaskPlanner(nf, nr, shared_mp=3, shared_fc=2, conditioning="cascade").eval()
+    x, gap, edge = _inputs()
+    z, _, atom_emb = model.encode(x, gap, edge)
+    n = x.size(1)
+    assert model.forward_family(z, gap).shape == (1, nf)
+    assert model.forward_reagent(z, gap=gap, atom_emb=atom_emb).shape == (1, nr)
+    assert model.forward_sites(atom_emb, z, gap).shape == (n,)
+    rebuilt = build_planner(model.arch_meta(), nf, nr)
+    assert rebuilt.conditioning == "cascade"
+    rebuilt.load_state_dict(model.state_dict())
+    rebuilt.eval()
+    z_r, _, a_r = rebuilt.encode(x, gap, edge)
+    assert torch.allclose(rebuilt.forward_family(z_r, gap), model.forward_family(z, gap))
+    assert torch.allclose(
+        rebuilt.forward_reagent(z_r, gap=gap, atom_emb=a_r),
+        model.forward_reagent(z, gap=gap, atom_emb=atom_emb),
+    )
+
+    def touched(p):
+        return p.grad is not None and bool(p.grad.abs().sum() > 0)
+
+    model.train()
+    model.zero_grad()
+    z, _, atom_emb = model.encode(x, gap, edge)
+    model.forward_reagent(z, gap=gap, atom_emb=atom_emb).sum().backward()
+    assert touched(model.family_mix[0].weight)
+    assert touched(model.reagent_mix[0].weight)
+    assert not touched(model.site_mix[0].weight)
+
+    model.zero_grad()
+    z, _, atom_emb = model.encode(x, gap, edge)
+    model.forward_sites(atom_emb, z, gap).sum().backward()
+    assert touched(model.family_mix[0].weight)
+    assert touched(model.reagent_mix[0].weight)
+    assert touched(model.site_mix[0].weight)
+
+    par = MultitaskPlanner(nf, nr, shared_mp=3, shared_fc=2, conditioning="parallel")
+    z, _, atom_emb = par.encode(x, gap, edge)
+    par.forward_sites(atom_emb, z, gap).sum().backward()
+    assert not touched(par.family_mix[0].weight)
+    assert not touched(par.reagent_mix[0].weight)
+    assert touched(par.site_mix[0].weight)
+
+
+def test_holdout_and_kfold_disjoint_parents():
+    from ml.training.pair_cache import holdout_and_kfold
+
+    rng = np.random.default_rng(0)
+    groups = np.repeat(np.arange(500), rng.integers(1, 21, 500))
+    test, fold = holdout_and_kfold(groups, test_frac=0.2, n_folds=10, seed=42)
+    assert test.sum() / len(test) == pytest.approx(0.2, abs=0.02)
+    assert set(fold[test].tolist()) == {-1}
+    assert set(fold[~test].tolist()) == set(range(10))
+    for g in np.unique(groups):
+        codes = fold[groups == g]
+        assert len(set(codes.tolist())) == 1
+        if codes[0] == -1:
+            assert bool(test[groups == g].all())
+        else:
+            assert not bool(test[groups == g].any())
+    rest = ~test
+    for k in range(10):
+        assert not bool(np.intersect1d(groups[fold == k], groups[test]).size)
+        others = rest & (fold != k)
+        assert not bool(np.intersect1d(groups[fold == k], groups[others]).size)
+    t2, f2 = holdout_and_kfold(groups, test_frac=0.2, n_folds=10, seed=42)
+    assert np.array_equal(test, t2) and np.array_equal(fold, f2)
+
+
+def test_backend_loads_cascade_checkpoint(tmp_path: Path):
+    _write_mt_checkpoint(tmp_path, shared_mp=3, shared_fc=2, conditioning="cascade")
+    bundle = LearnedPlannerBundle(tmp_path)
+    assert bundle.available, bundle.unavailable_reason
+    assert isinstance(bundle._model, MultitaskPlanner)
+    assert bundle._model.conditioning == "cascade"
+    assert not bundle.ranks_reagent_sites
+    gap = [0.1, 100.0, 1.0, 10.0]
+    families, sites, per_fam = bundle.plan("c1ccccc1N(=O)=O", gap, k_families=3, k_reagents=2)
+    assert families and sites and all(f in per_fam for f in families)
 
 
 def test_backend_loads_unconditioned_checkpoint(tmp_path: Path):

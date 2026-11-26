@@ -13,7 +13,12 @@ from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem
 from rdkit.Chem.Scaffolds import MurckoScaffold
 
-from backend.app.services.chemistry import canonicalize, edit_distance_proxy, validate_molecule
+from backend.app.services.chemistry import (
+    canonicalize,
+    edit_distance_proxy,
+    sanitize_reaction_product,
+    validate_molecule,
+)
 from backend.app.services.prediction import PropertyPredictor
 from backend.app.services.reaction_primitives import list_primitives
 from backend.app.services.safety import estimate_safety
@@ -90,8 +95,13 @@ def generate(
                         if site_key in seen_sites:
                             continue
                         for product in product_tuple:
+                            product = sanitize_reaction_product(product)
+                            if product is None:
+                                failures.append(
+                                    {"parent": parent, "smarts": smarts, "error": "sanitize_failed"}
+                                )
+                                continue
                             try:
-                                Chem.SanitizeMol(product)
                                 child = Chem.MolToSmiles(product, canonical=True)
                             except Exception as e:
                                 failures.append({"parent": parent, "smarts": smarts, "error": str(e)})

@@ -580,8 +580,8 @@ def train(
             flush=True,
         )
 
-        # Family alone peaked at epoch 1 while site/reagent were still random.
-        score = fam_acc + 0.5 * site_acc + 0.25 * reag_oracle_acc
+        # Site and reagent dominate; family is a light tie-break.
+        score = 0.25 * fam_acc + site_acc + reag_oracle_acc
         if score > best_score + 1e-4:
             best_score = score
             best_fam_acc = fam_acc
@@ -729,9 +729,10 @@ if __name__ == "__main__":
     mt.add_argument("--mt-tower-hidden", type=int, default=DEFAULT_MT_TOWER_HIDDEN, help="tower width")
     mt.add_argument("--mt-loss-weighting", choices=("fixed", "uncertainty"), default="fixed",
                     help="fixed: --loss-*-weight. uncertainty: learned per-task weights (Kendall et al.)")
-    mt.add_argument("--mt-conditioning", choices=("hierarchical", "none"), default=DEFAULT_MT_CONDITIONING,
-                    help="hierarchical: reagent tower sees the family and site tower the reagent "
-                    "(ModificationPlanner chain). none: parallel, unconditioned heads after the fork")
+    mt.add_argument("--mt-conditioning", choices=("hierarchical", "none", "parallel", "cascade"),
+                    default=DEFAULT_MT_CONDITIONING,
+                    help="hierarchical: reagent tower sees the family one-hot, site tower the reagent id. "
+                    "none/parallel: unconditioned heads. cascade: reagent reads family hidden, site reads reagent hidden")
     mt.add_argument("--batch-size", type=int, default=16, help="pairs per optimizer step (legacy: --accum-steps)")
     mt.add_argument("--max-train", type=int, default=-1, help="subsample the train split (search); -1 = all")
     mt.add_argument("--max-val", type=int, default=-1, help="subsample the val split (search); -1 = all")

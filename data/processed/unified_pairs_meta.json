@@ -1,0 +1,31 @@
+{
+  "source": "Daniel Lowe, Chemical reactions from US patents (1976-Sep2016)",
+  "source_doi": "10.6084/m9.figshare.5104873",
+  "source_url": "https://figshare.com/articles/dataset/Chemical_reactions_from_US_patents_1976-Sep2016_/5104873",
+  "source_file": "1976_Sep2016_USPTOgrants_smiles.rsmi",
+  "figshare_file_url": "https://ndownloader.figshare.com/files/8664379",
+  "license": "CC0-1.0",
+  "method": "Each patent-grant reaction is kept when one reactant component, transformed by one IGNITE reagent SMARTS, sanitizes to one recorded product component. The site atoms are the reacting atoms of that match. Components outside 6-80 heavy atoms, or with no carbon, are ignored. Stereochemistry is dropped so a template match is not rejected for a stereo mark the SMARTS does not write. Duplicate parent/child/reagent rows collapse to one. A stratified sample of 64 parents also gets one hold row: child equals parent, every delta is 0, and the reagent is hold. parent_*, child_*, and delta_* are XGBoost predictions from models/, not properties reported in the patent. The split is a 70/15/15 shuffle of Bemis-Murcko scaffolds.",
+  "label_type": "uspto_recorded+xgb_delta",
+  "sha256": "8dd127dc043cb155ad5e0d91d3575a9afa73d2792b954aceab0d1ff341640d2c",
+  "seed": 42,
+  "n_reactions_read": 179089,
+  "n_template_hits": 5075,
+  "n_unique_hits": 69,
+  "n_pairs": 64569,
+  "n_hold": 64,
+  "n_dropped_no_property": 0,
+  "n_scaffolds": 18448,
+  "sources": {
+    "uspto_grants_1976_2016": 34271,
+    "vanderlingen_reaction_smiles_2023": 19871,
+    "uspto_applications_2001_2016": 10299,
+    "ord_nonpatent": 64
+  },
+  "licenses": {
+    "uspto_grants_1976_2016": "CC0-1.0",
+    "uspto_applications_2001_2016": "CC0-1.0",
+    "vanderlingen_reaction_smiles_2023": "CC-BY-4.0",
+    "ord_nonpatent": "CC-BY-SA-4.0"
+  }
+}

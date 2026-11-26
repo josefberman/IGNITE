@@ -11,7 +11,11 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 
 from backend.app.domain.models import ModificationMode, ModificationRecord, PROPERTY_KEYS
-from backend.app.services.chemistry import edit_distance_proxy, validate_molecule
+from backend.app.services.chemistry import (
+    edit_distance_proxy,
+    sanitize_reaction_product,
+    validate_molecule,
+)
 from backend.app.services.reagents import apply_reagent_random_sites, rank_reagents_for_gap
 from backend.app.services.reaction_primitives import (
     StrategyPoolModifier,
@@ -71,8 +75,10 @@ def _run_smarts_on_parent(
         for pi, product_tuple in enumerate(products):
             mscore = match_scores[pi] if pi < len(match_scores) else 0
             for product in product_tuple:
+                product = sanitize_reaction_product(product)
+                if product is None:
+                    continue
                 try:
-                    Chem.SanitizeMol(product)
                     smi = Chem.MolToSmiles(product, canonical=True)
                 except Exception:
                     continue
@@ -387,6 +393,29 @@ class ModificationMechanism:
         self.rng = rng or random.Random(42)
         self._prims = _primitives_by_family()
 
+    def _reagent_sites_by_gap(
+        self,
+        parent_smiles: str,
+        mol: Chem.Mol,
+        gap_vector: Sequence[float],
+        reagent_id: str,
+    ) -> List[Tuple[str, str]]:
+        """SMARTS products of one reagent, best gap alignment first.
+
+        The template still decides which sites exist. The order is the cosine
+        between each child's predicted property change and the requested gap.
+        """
+        from backend.app.services.reagents import reagent_smarts
+        from ml.site_candidates import reaction_sites
+
+        by_child: Dict[str, str] = {}
+        for cand in reaction_sites(mol, parent_smiles, reagent_smarts(reagent_id)):
+            by_child.setdefault(cand.child, cand.smarts)
+        if not by_child:
+            return []
+        order = self._rank_children(parent_smiles, list(by_child), gap_vector)
+        return [(smi, by_child[smi]) for smi in order]
+
     def _rank_children(
         self,
         parent_smiles: str,
@@ -521,7 +550,6 @@ class ModificationMechanism:
         # the next call on the same molecule uses the next family and reagent.
         tried = skip_reagents if skip_reagents is not None else set()
         mol = Chem.MolFromSmiles(parent_smiles)
-        family_cap = max(8, n * 3)
 
         if mode == ModificationMode.PLANNER:
             if not self.learned.available:
@@ -532,56 +560,35 @@ class ModificationMechanism:
             if mol is None:
                 return products[:n]
             k_fam = max(3, min(8, n * 2))
-            families, sites, reag_by_fam = self.learned.plan(
+            families, _sites, reag_by_fam = self.learned.plan(
                 parent_smiles,
                 gap_vec,
                 k_families=k_fam,
                 k_reagents=max(2, min(5, n + 1)),
-                top_m_sites=8,
             )
-            site_aware = self.learned.ranks_reagent_sites
-            z = atom_emb = None
-            if site_aware:
-                z, atom_emb = self.learned.encode(parent_smiles, gap_vec)
-            raw_children: List[Tuple[str, str, str, str]] = []  # smi, family, reagent, smarts
+            # Family and reagent stay in the model's top-1 order. Within one
+            # reagent, the site is the SMARTS child whose property change best
+            # follows the gap. Further slots are the next sites, then the next reagent.
             for group in families:
                 for reaction_id in reag_by_fam.get(group, []):
                     if reaction_id in tried:
                         continue
                     tried.add(reaction_id)
-                    if site_aware:
-                        ranked = self.learned.rank_reagent_sites(
-                            parent_smiles, mol, gap_vec, reaction_id, z=z, atom_emb=atom_emb
-                        )[:family_cap]
-                        for smi, smarts in ranked:
-                            raw_children.append((smi, group, reaction_id, smarts))
-                        continue
-                    for smi, _variant, smarts in self._apply_family(
-                        parent_smiles,
-                        mol,
-                        reaction_id,
-                        preferred_atoms=sites,
-                        max_products=family_cap,
+                    for smi, smarts in self._reagent_sites_by_gap(
+                        parent_smiles, mol, gap_vec, reaction_id
                     ):
-                        raw_children.append((smi, group, reaction_id, smarts))
-            order = self._rank_children(
-                parent_smiles, [c[0] for c in raw_children], gap_vec
-            )
-            by_smi = {c[0]: c for c in raw_children}
-            for smi in order:
-                fam, reagent_id, smarts = by_smi[smi][1], by_smi[smi][2], by_smi[smi][3]
-                if self._accept(
-                    parent_smiles,
-                    smi,
-                    family=fam,
-                    reagent=reagent_id,
-                    smarts=smarts,
-                    planner="learned",
-                    seen=seen,
-                    products=products,
-                    n=n,
-                ):
-                    break
+                        if self._accept(
+                            parent_smiles,
+                            smi,
+                            family=group,
+                            reagent=reaction_id,
+                            smarts=smarts,
+                            planner="learned",
+                            seen=seen,
+                            products=products,
+                            n=n,
+                        ):
+                            return products[:n]
             return products[:n]
 
         # Rule-based: reagent level only. Rank reagents by whether their documented

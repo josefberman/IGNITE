@@ -107,6 +107,22 @@ def site_scores(model, encoded, gap, reagent_idx):
         return model.forward_sites(atom_emb, z, gap, reagent_idx=reagent_idx)
 
 
+def planner_atom_logits(model, atom_x, edge, gap, reagent_idx, encoded_cache, smiles):
+    """Site logit per atom. Multitask checkpoints encode with the gap; the legacy encoder does not."""
+    import torch
+
+    if not hasattr(model, "parent_enc"):
+        with torch.inference_mode():
+            z, _, atom_emb = model.encode(atom_x, gap, edge)
+            return model.forward_sites(atom_emb, z, gap, reagent_idx=reagent_idx)
+    if smiles not in encoded_cache:
+        encoded_cache[smiles] = encode_parent(model, atom_x, edge)
+    encoded = encoded_cache[smiles]
+    if encoded is None:
+        return None
+    return site_scores(model, encoded, gap, reagent_idx)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", type=Path, default=ROOT / "data" / "processed" / "modification_pairs.csv")
@@ -192,24 +208,30 @@ def main(argv=None) -> int:
             continue
         true_group = min(group_of[m] for m, p in enumerate(pos) if p)
 
-        if smiles not in encoded_cache:
-            graph = mol_to_graph(smiles)
-            if graph is None:
-                encoded_cache[smiles] = None
-            else:
-                x, edge = graph
-                encoded_cache[smiles] = encode_parent(model, x.unsqueeze(0), edge)
-        encoded = encoded_cache[smiles]
-        if encoded is None:
-            n_no_site += 1
-            continue
         parent = {k: float(getattr(rec, f"parent_{k}")) for k in PROP_COLS}
         target = {k: float(getattr(rec, f"child_{k}")) for k in PROP_COLS}
         gap = torch.tensor([planner_input_from_parent_target(parent, target)], dtype=torch.float32)
         reag_idx = None
         if reagent in bundle.reagent_names:
             reag_idx = torch.tensor([bundle.reagent_names.index(reagent)])
-        atom_logits = site_scores(model, encoded, gap, reag_idx)
+        if smiles not in encoded_cache:
+            graph = mol_to_graph(smiles)
+            if graph is None:
+                encoded_cache[smiles] = None
+            elif hasattr(model, "parent_enc"):
+                x, edge = graph
+                encoded_cache[smiles] = encode_parent(model, x.unsqueeze(0), edge)
+            else:
+                encoded_cache[smiles] = graph
+        cached = encoded_cache[smiles]
+        if cached is None:
+            n_no_site += 1
+            continue
+        if hasattr(model, "parent_enc"):
+            atom_logits = site_scores(model, cached, gap, reag_idx)
+        else:
+            x, edge = cached
+            atom_logits = planner_atom_logits(model, x.unsqueeze(0), edge, gap, reag_idx, encoded_cache, smiles)
         planner_group = group_of[int(candidate_logits(atom_logits, cands).argmax().item())]
         rows.append((true_group, planner_group, rule_group))
         if i % 2000 == 0 or i == n:

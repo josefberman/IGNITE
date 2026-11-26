@@ -13,6 +13,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
+from backend.app.services.chemistry import sanitize_reaction_product
+
 
 @dataclass(frozen=True)
 class SiteCandidate:
@@ -49,6 +51,11 @@ def reacting_atom_indices(mol: Chem.Mol, rxn, product_index: int) -> List[int]:
         return reacting_atoms_for_match(rxn, matches[product_index])
     except Exception:
         return []
+
+
+def _identity_smarts(smarts: str) -> bool:
+    left, sep, right = smarts.partition(">>")
+    return bool(sep) and left == right
 
 
 def _canonical(smiles: str) -> Optional[str]:
@@ -94,12 +101,18 @@ def reaction_sites(
             if not atoms or atoms in seen:
                 continue
             for product in product_tuple:
+                product = sanitize_reaction_product(product)
+                if product is None:
+                    continue
                 try:
-                    Chem.SanitizeMol(product)
                     child = _canonical(Chem.MolToSmiles(product, canonical=True))
                 except Exception:
                     continue
-                if not child or "." in child or child == parent_smiles:
+                if not child or "." in child:
+                    continue
+                # A real reagent that regenerates the parent is not a site.
+                # An identity template (same SMARTS on both sides) is the hold reaction.
+                if child == parent_smiles and not _identity_smarts(smarts):
                     continue
                 seen.add(atoms)
                 out.append(SiteCandidate(atoms=atoms, child=child, smarts=smarts))

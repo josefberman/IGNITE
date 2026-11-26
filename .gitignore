@@ -10,6 +10,12 @@ frontend/dist/
 data/ignite.db
 # Regenerated pairs exceed GitHub's 100 MB file limit.
 data/processed/modification_pairs.csv
+data/processed/uspto_pairs.csv
+data/processed/unified_pairs.csv
+data/processed/uspto_pair_hits.jsonl
+data/processed/uspto_prop_cache.jsonl
+data/raw/uspto/
+*.parquet
 output/
 *.sqlite
 .pytest_cache/

@@ -135,6 +135,20 @@ Outputs in `--out-dir`:
 - `dataset_meta.json` — pair count and checksum
 - `failures.json` — up to 1000 SMARTS / sanitization failures
 
+### Recorded reaction pairs
+
+`data/processed/unified_pairs.csv` is the same column layout plus `patent`, `year`, and `source`. It combines US patent grants, US patent applications, the van der Lingen reaction-SMILES set, and the non-patent Open Reaction Database rows that an IGNITE reagent reproduces. These are recorded reactions, not shuffled SMARTS applications on the seed library.
+
+Source: Daniel Lowe, [Chemical reactions from US patents (1976-Sep2016)](https://doi.org/10.6084/m9.figshare.5104873), figshare (CC0). The file is `1976_Sep2016_USPTOgrants_smiles.rsmi` (grants only; [direct archive](https://ndownloader.figshare.com/files/8664379)).
+
+A row is kept when one reactant component, passed through one IGNITE reagent SMARTS, sanitizes to one recorded product component. The site is the reacting-atom list of that match. Molecules outside 6–80 heavy atoms, or with no carbon, are dropped. Stereochemistry is removed so a real reaction is not rejected for a stereo mark the SMARTS does not write. The same parent, child, and reagent are stored once. `parent_*`, `child_*`, and `delta_*` are predictions from the XGBoost models in `models/`. The patents do not report those four properties. The split is a 70/15/15 shuffle of Bemis-Murcko scaffolds (`--seed` default 42). Counts and the checksum are written to `data/processed/unified_pairs_meta.json`.
+
+```bash
+python -m ml.data_gen.uspto_pairs --download
+```
+
+The CSV is not committed. Pass it to training with `--data data/processed/unified_pairs.csv`.
+
 ### 3. Train the planner
 
 Trains `ModificationPlanner` (family, reagent, and site heads) on the pairs CSV. Property changes are scored by the XGBoost regressors, not by a second network. Early stopping uses validation family top-1, site top-1, and reagent-given-true-family accuracy. The best epoch is written to the checkpoint.

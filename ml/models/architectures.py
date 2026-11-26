@@ -122,6 +122,22 @@ DEFAULT_REAGENT_LAYERS = 1
 DEFAULT_SITE_LAYERS = 1
 
 
+def _mlp_hidden(in_dim: int, hidden: int, n_hidden: int, dropout: float) -> nn.Module:
+    """``n_hidden`` layers of Linear-GELU-Dropout. ``0`` is identity (hidden = input)."""
+    if n_hidden <= 0:
+        return nn.Identity()
+    mods: List[nn.Module] = []
+    width = in_dim
+    for _ in range(n_hidden):
+        mods.extend((nn.Linear(width, hidden), nn.GELU(), nn.Dropout(dropout)))
+        width = hidden
+    return nn.Sequential(*mods)
+
+
+def _hidden_width(in_dim: int, hidden: int, n_hidden: int) -> int:
+    return hidden if n_hidden >= 1 else in_dim
+
+
 def _mlp_head(in_dim: int, hidden: int, out_dim: int, n_hidden: int, dropout: float) -> nn.Module:
     """``n_hidden`` hidden layers, then a linear map to ``out_dim``. ``0`` is one linear layer."""
     if n_hidden <= 0:
@@ -407,9 +423,11 @@ DEFAULT_MT_BRANCH_MP = 0
 DEFAULT_MT_SHARED_FC = 0
 DEFAULT_MT_TOWER_LAYERS = 1
 DEFAULT_MT_TOWER_HIDDEN = DEFAULT_HIDDEN
-# "hierarchical": reagent tower sees the family, site tower sees the reagent
-# (the ModificationPlanner chain). "none": three parallel, unconditioned heads.
-MT_CONDITIONING = ("hierarchical", "none")
+# "hierarchical": reagent tower sees the family one-hot, site tower the reagent id
+# (the ModificationPlanner chain). "none": three parallel, unconditioned heads
+# (legacy). "parallel": same wiring as none, split towers so hiddens exist.
+# "cascade": reagent reads the family hidden, site reads the reagent hidden.
+MT_CONDITIONING = ("hierarchical", "none", "parallel", "cascade")
 DEFAULT_MT_CONDITIONING = "hierarchical"
 
 
@@ -505,7 +523,10 @@ class MultitaskPlanner(nn.Module):
     ``ModificationPlanner``. With ``conditioning="none"`` the three heads are
     parallel and see only their branch of the shared representation and the
     gap; ``family_idx`` / ``reagent_idx`` are ignored and the site head is
-    reagent-blind (``site_reagent`` is False).
+    reagent-blind (``site_reagent`` is False). ``parallel`` is the same
+    wiring with split hidden/logit modules. ``cascade`` feeds the family
+    hidden into the reagent tower and the reagent hidden into the site
+    tower; training and inference use that forward, not the true labels.
 
     ``shared_mp=L, branch_mp=0, shared_fc=0``, one-layer towers and
     ``tower_hidden=hidden`` compute exactly what ``ModificationPlanner`` with
@@ -542,13 +563,13 @@ class MultitaskPlanner(nn.Module):
         super().__init__()
         if conditioning not in MT_CONDITIONING:
             raise ValueError(f"conditioning must be one of {MT_CONDITIONING}, got {conditioning!r}")
-        if conditioning == "none":
+        if conditioning in ("none", "parallel", "cascade"):
             site_reagent = False
         self.conditioning = conditioning
         if shared_mp < 0 or branch_mp < 0 or shared_fc < 0:
             raise ValueError("shared_mp, branch_mp and shared_fc must be >= 0")
         if shared_mp + branch_mp < 1:
-            raise ValueError("need at least one message-passing layer (shared_mp + branch_mp >= 1)")
+            raise ValueError("need at least one message-passing layer")
         if branch_mp > 0 and shared_fc > 0:
             raise ValueError("shared_fc applies only when the fork is after the graph vector (branch_mp=0)")
         self.hidden = hidden
@@ -588,17 +609,37 @@ class MultitaskPlanner(nn.Module):
             self.shared_fc = _shared_fc(hidden, shared_fc, dropout)
 
         th = self.tower_hidden
-        self.family_tower = _mlp_head(hidden + gap_dim, th, n_families, family_tower_layers, dropout)
-        fam_in = n_families if conditioning == "hierarchical" else 0
-        self.reagent_tower = _mlp_head(
-            hidden + fam_in + gap_dim + hidden * 2, th, n_reagents, reagent_tower_layers, dropout
-        )
-        site_in = hidden * 2 + hidden + gap_dim
-        if site_reagent:
-            self.site_reagent_emb = nn.Embedding(n_reagents, hidden)
-            site_in += hidden
-        else:
+        if conditioning in ("parallel", "cascade"):
+            fam_in = hidden + gap_dim
+            self.family_mix = _mlp_hidden(fam_in, th, family_tower_layers, dropout)
+            fam_h = _hidden_width(fam_in, th, family_tower_layers)
+            self.family_out = nn.Linear(fam_h, n_families)
+            self.family_tower = None
+            reag_in = hidden + gap_dim + (fam_h if conditioning == "cascade" else 0)
+            self.reagent_mix = _mlp_hidden(reag_in, th, reagent_tower_layers, dropout)
+            reag_h = _hidden_width(reag_in, th, reagent_tower_layers)
+            self.reagent_out = nn.Linear(reag_h, n_reagents)
+            self.reagent_tower = None
+            site_in = hidden * 2 + hidden + gap_dim
+            if conditioning == "cascade":
+                site_in += reag_h
             self.site_reagent_emb = None
+        else:
+            self.family_mix = None
+            self.family_out = None
+            self.family_tower = _mlp_head(hidden + gap_dim, th, n_families, family_tower_layers, dropout)
+            fam_in = n_families if conditioning == "hierarchical" else 0
+            self.reagent_mix = None
+            self.reagent_out = None
+            self.reagent_tower = _mlp_head(
+                hidden + fam_in + gap_dim + hidden * 2, th, n_reagents, reagent_tower_layers, dropout
+            )
+            site_in = hidden * 2 + hidden + gap_dim
+            if site_reagent:
+                self.site_reagent_emb = nn.Embedding(n_reagents, hidden)
+                site_in += hidden
+            else:
+                self.site_reagent_emb = None
         self.site_mix = _site_mix(site_in, th, site_tower_layers)
         self.site_head = nn.Linear(th, 1)
 
@@ -650,18 +691,35 @@ class MultitaskPlanner(nn.Module):
             out[t] = (z, torch.cat([local, hb], dim=-1))
         return out
 
-    def family_logits(self, z_f, gap):
-        return self.family_tower(torch.cat([z_f, gap], dim=-1))
+    def family_hidden(self, z_f, gap):
+        return self.family_mix(torch.cat([z_f, gap], dim=-1))
 
-    def reagent_logits(self, z_r, fam_feat, gap, atom_emb_r, batch, n_graphs):
+    def family_logits(self, z_f, gap):
+        if self.family_tower is not None:
+            return self.family_tower(torch.cat([z_f, gap], dim=-1))
+        return self.family_out(self.family_hidden(z_f, gap))
+
+    def reagent_hidden(self, z_r, fam_feat, gap, atom_emb_r, batch, n_graphs, fam_h=None):
+        if self.conditioning == "cascade":
+            return self.reagent_mix(torch.cat([z_r, gap, fam_h], dim=-1))
+        if self.conditioning == "parallel":
+            return self.reagent_mix(torch.cat([z_r, gap], dim=-1))
         local = _seg_max(atom_emb_r, batch, n_graphs)
         if self.conditioning == "none":
-            return self.reagent_tower(torch.cat([z_r, gap, local], dim=-1))
-        return self.reagent_tower(torch.cat([z_r, fam_feat, gap, local], dim=-1))
+            return torch.cat([z_r, gap, local], dim=-1)
+        return torch.cat([z_r, fam_feat, gap, local], dim=-1)
 
-    def site_logits(self, atom_emb_s, z_s, gap, batch, reagent_idx=None):
+    def reagent_logits(self, z_r, fam_feat, gap, atom_emb_r, batch, n_graphs, fam_h=None):
+        h = self.reagent_hidden(z_r, fam_feat, gap, atom_emb_r, batch, n_graphs, fam_h=fam_h)
+        if self.reagent_tower is not None:
+            return self.reagent_tower(h)
+        return self.reagent_out(h)
+
+    def site_logits(self, atom_emb_s, z_s, gap, batch, reagent_idx=None, reag_h=None):
         parts = [atom_emb_s, z_s[batch], gap[batch]]
-        if self.site_reagent_emb is not None:
+        if self.conditioning == "cascade":
+            parts.append(reag_h[batch])
+        elif self.site_reagent_emb is not None:
             if reagent_idx is None:
                 reag = z_s.new_zeros(z_s.size(0), self.hidden)
             else:
@@ -695,6 +753,11 @@ class MultitaskPlanner(nn.Module):
     def forward_reagent(self, z, *, family_idx=None, gap=None, atom_emb=None):
         gap_t = self._gap(z, gap)
         z_r = self._slice(z, "reagent", self.hidden)
+        if self.conditioning in ("parallel", "cascade"):
+            fam_h = None
+            if self.conditioning == "cascade":
+                fam_h = self.family_hidden(self._slice(z, "family", self.hidden), gap_t)
+            return self.reagent_out(self.reagent_hidden(z_r, None, gap_t, None, None, None, fam_h=fam_h))
         if atom_emb is None:
             local = torch.zeros(z.size(0), self.hidden * 2, device=z.device, dtype=z.dtype)
         else:
@@ -711,12 +774,20 @@ class MultitaskPlanner(nn.Module):
         emb = self._slice(atom_emb, "site", self.hidden * 2)
         B, N, _ = emb.shape
         batch = torch.arange(B, device=emb.device).repeat_interleave(N)
+        gap_t = self._gap(z, gap)
+        reag_h = None
+        if self.conditioning == "cascade":
+            fam_h = self.family_hidden(self._slice(z, "family", self.hidden), gap_t)
+            reag_h = self.reagent_hidden(
+                self._slice(z, "reagent", self.hidden), None, gap_t, None, None, None, fam_h=fam_h
+            )
         logits = self.site_logits(
             emb.reshape(B * N, -1),
             self._slice(z, "site", self.hidden),
-            self._gap(z, gap),
+            gap_t,
             batch,
             reagent_idx,
+            reag_h=reag_h,
         ).view(B, N)
         if B == 1:
             return logits.squeeze(0)
@@ -764,6 +835,8 @@ def build_planner(meta: dict, n_families: int, n_reagents: int) -> nn.Module:
     bond_types = int(meta.get("bond_types", 0))
     site_reagent = bool(meta.get("site_reagent", False))
     if meta.get("architecture") == "multitask":
+        if int(meta.get("mt_site_mp", 0)) > 0:
+            raise ValueError("checkpoints with a private site message-passing stack are no longer supported")
         return MultitaskPlanner(
             n_families=n_families,
             n_reagents=n_reagents,
