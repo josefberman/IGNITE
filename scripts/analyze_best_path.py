@@ -127,11 +127,9 @@ def plot(
     ax.legend(frameon=False)
     ax.grid(alpha=0.3)
     fig.tight_layout()
-    paths = []
-    for ext, kw in (("pdf", {}), ("svg", {}), ("png", {"dpi": 300})):
-        p = out_dir / f"{stem}.{ext}"
-        fig.savefig(p, **kw)
-        paths.append(p)
+    p = out_dir / f"{stem}.svg"
+    fig.savefig(p)
+    paths = [p]
     plt.close(fig)
     return paths
 
