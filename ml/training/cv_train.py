@@ -37,7 +37,7 @@ def main(
     shared_mp: int | None = None,
 ) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--data", type=Path, default=ROOT / "data" / "processed" / "modification_pairs.csv")
+    ap.add_argument("--data", type=Path, default=ROOT / "data" / "processed" / "unified_pairs.csv")
     ap.add_argument("--out", type=Path, default=out)
     ap.add_argument("--cache", type=Path, default=None)
     ap.add_argument("--epochs", type=int, default=30)

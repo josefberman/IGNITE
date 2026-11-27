@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 import random
-import re
 from pathlib import Path
 
 from backend.app.domain.models import ModificationMode, PROPERTY_KEYS
@@ -25,22 +24,6 @@ ROOT = Path(__file__).resolve().parents[2]
 _TARGET = {"density": 1.8, "det_velocity": 8500.0, "det_pressure": 30.0, "hf_solid": 100.0}
 
 
-def _parse_reagents_doc() -> dict[str, tuple[str, ...]]:
-    text = (ROOT / "docs" / "reagents.md").read_text(encoding="utf-8")
-    rows = re.findall(
-        r"^\| `(\w+)` \| .+? \| (raise|lower|neutral) \| (raise|lower|neutral) \| (raise|lower|neutral) \| (raise|lower|neutral) \|$",
-        text,
-        re.M,
-    )
-    return {r[0]: tuple(r[1:]) for r in rows}
-
-
-def _parse_family_doc() -> dict[str, tuple[int, ...]]:
-    text = (ROOT / "docs" / "reaction_families.md").read_text(encoding="utf-8").replace("−", "-")
-    rows = re.findall(r"^\| `(\w+)` \| .+ \| ([-+0-9, ]+) \|\s*$", text, re.M)
-    return {r: tuple(int(x) for x in v.split(",")) for r, v in rows}
-
-
 def test_reagents_have_all_four_effects():
     assert REAGENTS
     for r in REAGENTS:
@@ -48,15 +31,11 @@ def test_reagents_have_all_four_effects():
         assert all(v in EFFECT_SIGN for _, v in r.effects)
 
 
-def test_reagent_list_matches_docs_and_primitives():
+def test_reagent_list_matches_primitives():
     prims = {p["family_id"]: tuple(p["delta"]) for p in list_primitives() if p["family_id"] != "identity"}
     assert set(REAGENTS_BY_ID) == set(prims)
-    family_doc = _parse_family_doc()
-    reagents_doc = _parse_reagents_doc()
-    assert set(family_doc) == set(REAGENTS_BY_ID) == set(reagents_doc)
     for rid, r in REAGENTS_BY_ID.items():
-        assert r.signs() == family_doc[rid] == prims[rid]
-        assert tuple(r.effect(k) for k in PROPERTY_KEYS) == reagents_doc[rid]
+        assert r.signs() == prims[rid]
 
 
 def test_desired_signs_follow_gap():

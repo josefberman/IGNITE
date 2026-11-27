@@ -7,8 +7,10 @@ parallel, and stores flat numpy arrays:
 
 * per parent: atom features, typed edges, applicable-family and
   applicable-reagent masks;
-* per pair: family / reagent index, planner gap (no jitter), labeled site atoms,
-  the reagent's candidate sites and which of them give the labeled child.
+* per pair: family / reagent index, the exact child−parent gap, parent and child
+  properties, labeled site atoms, the reagent's candidate sites and which of
+  them give the labeled child. Training batches replace the exact gap with a
+  target the recorded child is closer to.
 
 The labels, masks, and candidates are the ones ``PairDataset`` builds on the
 fly; pairs whose parent or child SMILES does not parse are dropped (the legacy
@@ -26,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 SPLIT_CODES = {"train": 0, "val": 1, "test": 2}
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
 def random_group_split(groups: np.ndarray, fractions=(0.7, 0.1, 0.2), seed: int = 42) -> np.ndarray:
@@ -194,6 +196,14 @@ def build_pair_cache(data_csv: Path, cache_path: Path, workers: int = 8) -> Path
             lab_cache[key] = (fam_to_idx.get(group, 0), reag_to_idx.get(specific, 0))
         fam_idx[i], reag_idx[i] = lab_cache[key]
     gap = _planner_gap(df)
+    from backend.app.domain.models import PROPERTY_KEYS
+
+    parent_props = np.stack(
+        [df[f"parent_{k}"].to_numpy(dtype=np.float64) for k in PROPERTY_KEYS], axis=1
+    ).astype(np.float32)
+    child_props = np.stack(
+        [df[f"child_{k}"].to_numpy(dtype=np.float64) for k in PROPERTY_KEYS], axis=1
+    ).astype(np.float32)
 
     parent_codes, parent_uniques = pd.factorize(df["parent_smiles"].astype(str))
     by_parent: dict = {}
@@ -266,6 +276,8 @@ def build_pair_cache(data_csv: Path, cache_path: Path, workers: int = 8) -> Path
         pair_fam=fam_idx[rows],
         pair_reag=reag_idx[rows],
         pair_gap=gap[rows],
+        pair_parent_props=parent_props[rows],
+        pair_child_props=child_props[rows],
         csv_split=df["split"].map(SPLIT_CODES).fillna(2).to_numpy(dtype=np.int8)[rows],
         row_parent_code=parent_codes.astype(np.int64),
         site_ptr=site_ptr,
@@ -338,8 +350,10 @@ class PairCache:
             raise ValueError(f"unknown split mode {mode!r}")
         return random_group_split(groups, fractions, seed)[self.pair_row]
 
-    def batch(self, idx: np.ndarray):
+    def batch(self, idx: np.ndarray, *, train: bool = False, rng: np.random.Generator | None = None):
         import torch
+
+        from ml.planner_gap import encode_property_gaps, sample_gap_reducing_targets
 
         xs, es, batch_vec = [], [], []
         site_t_idx, cand_seg, cand_atom_idx, cand_atom_cand, cand_pos = [], [], [], [], []
@@ -371,12 +385,20 @@ class PairCache:
             off += n
         par = self.pair_parent[idx]
         cat = lambda v, dt: torch.from_numpy(np.concatenate(v).astype(dt)) if v else torch.zeros(0, dtype=torch.long)
+        if train and getattr(self, "pair_parent_props", None) is not None:
+            gen = rng if rng is not None else np.random.default_rng()
+            target = sample_gap_reducing_targets(
+                self.pair_parent_props[idx], self.pair_child_props[idx], gen
+            )
+            gap = encode_property_gaps(target - self.pair_parent_props[idx])
+        else:
+            gap = self.pair_gap[idx]
         return {
             "x": torch.from_numpy(np.concatenate(xs)),
             "edge": torch.from_numpy(np.concatenate(es, axis=1)),
             "batch": torch.from_numpy(np.concatenate(batch_vec)),
             "n": len(idx),
-            "gap": torch.from_numpy(self.pair_gap[idx]),
+            "gap": torch.from_numpy(np.ascontiguousarray(gap)),
             "fam": torch.from_numpy(self.pair_fam[idx].astype(np.int64)),
             "reag": torch.from_numpy(self.pair_reag[idx].astype(np.int64)),
             "fam_allow": torch.from_numpy(self.fam_allow[par]),

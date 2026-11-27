@@ -2,7 +2,7 @@
 
 **Intelligent Generation and Navigation through Iterative Transformations of Energetics**
 
-*Working source for an academic paper. Numbers below are the ones measured in this repository. Where a study has not been run, the section says so and gives the protocol, not a result.*
+*This is the only project document that explains the system and reports results. Numbers below are the ones measured in this repository. Where a study has not been run, the section says so and gives the protocol, not a result.*
 
 ---
 
@@ -180,7 +180,7 @@ A 50-target suite of this loop is summarized in §9.3. It measures the search, n
 
 ## 5. Reaction catalog and the rule-based proposer
 
-Modules: `backend/app/services/reaction_primitives.py`, `backend/app/services/reagents.py`. Tables: `docs/reaction_families.md`, `docs/reagents.md`. A unit test keeps the two documents, the primitive deltas, and the rule-based list on the same ids.
+Modules: `backend/app/services/reaction_primitives.py`, `backend/app/services/reagents.py`. A unit test keeps the primitive deltas and the rule-based list on the same ids.
 
 ### 5.1 Catalog
 
@@ -228,7 +228,7 @@ The encoder is residual bond message passing.
   - **reagent** — which reaction inside the class;
   - **site** — a logit per atom. At training time the loss is a softmax over the reagent's candidate sites, and every site that yields the labeled child is correct.
 
-The family head and the reagent head together name the next reaction. The site head, followed by execution of the SMARTS, names the next molecule. Online, within one chosen reagent, products are then ordered by how the XGBoost property change aligns with the gap (§6.4). The site head is what the offline site comparison measures.
+The family head and the reagent head together name the next reaction. The site head, followed by execution of the SMARTS, names the candidate molecules. Online, a candidate is returned only when its predicted properties are closer to the target than the parent (§6.4).
 
 ### 6.2 The three layouts
 
@@ -255,8 +255,9 @@ Hidden size 128, 3 shared message-passing layers, one-layer towers, dropout 0.15
 1. Encode the parent and the signed normalized gap t − y.
 2. Take the top families (between 3 and 8, depending on width).
 3. For each family, take the top reagents masked to that family (between 2 and 5).
-4. Apply them in that order. Inside one reagent, order the SMARTS products by alignment of the XGBoost property delta with the gap.
-5. Tag accepted children `planner="learned"` and record the predicted family and reagent.
+4. Apply each reagent. The site head orders that reagent's products, highest mean site logit first.
+5. Predict each product's four properties. Keep a product only when its MAPE to the target is lower than the parent's. Return the lowest MAPE first, up to the beam width.
+6. Tag accepted children `planner="learned"` and record the predicted family and reagent.
 
 The true family and the true reagent are not inputs at search time. The reagent is chosen from the family the model just predicted, and the site is chosen for the reagent the model just predicted. The gold labels in §8 are used only while a training pair is being scored.
 
@@ -319,9 +320,9 @@ For each pair the loss is the sum of:
 - **reagent** cross-entropy over reagents in the true family that match the parent, with the gold reagent always allowed;
 - **site** softmax over the gold reagent's candidate sites. Every site that produces the labeled child is a positive. If no candidate is labeled, the softmax is over all atoms.
 
-Each term has weight 1. There is no property-delta regression in this loss. Property values are inputs (the gap) and, later, the search's scoring function.
+Each term has weight 1. There is no property-delta regression in this loss. The supervised reaction is the recorded one, and it is a reaction that decreases the gap to the target shown as input.
 
-The gap shown to the network is the signed, normalized difference between child and parent properties, which is the same encoding used at inference when the user target replaces the child.
+During training that target is the recorded child's properties, or a nearby point, kept only when the child's MAPE to it is lower than the parent's (`sample_gap_reducing_target`). The encoded input is the signed, normalized target − parent, the same encoding inference uses for the user's target. Evaluation uses the recorded child as the target, so the reported top-1 does not depend on the draw.
 
 ### 8.2 Epoch selection
 
@@ -378,10 +379,13 @@ Recorded evaluation rows. A row is kept when both methods return a decision. Fig
 | --- | ---: | ---: | ---: |
 | Reagent | 3,420 | 0.888 | 0.029 |
 | Site, given the recorded reagent | 3,416 | 0.912 | 0.690 |
+| Gap direction | 3,420 | 0.891 | 0.376 |
 
 **Reagent.** Architecture 3 takes its top family, then its top reagent inside that family, among reagents whose SMARTS matches the parent. The rule-based proposer takes the first gap-ranked reagent that matches the parent. The label is the reagent that produced the recorded child. The sign table has 81 directions and several reagents share one, so a ranker that sees only signs cannot identify which of those reagents was used. The learned head can, on this set, for 88.8% of rows.
 
 **Site.** Both methods are given the recorded reagent, so the comparison is the site decision alone. A site is one distinct product; symmetric atoms that give the same product count as one site, numbered within that parent by the lowest reacting-atom index. Architecture 3 picks the candidate with the highest mean site-head score. The rule-based proposer picks the first product of a seeded shuffle. The head matches the recorded product on 91.2% of rows. The shuffle matches on 69.0%, which is what a shuffle does when many reagents have only one or two products.
+
+**Gap direction.** Same reagent choices as the reagent row. A choice is correct when its design signs (Δρ, ΔD, ΔP, ΔHf) equal the recorded reagent's design signs. The reagent id may differ. Architecture 3 matches the direction on 89.1% of rows, only 0.3 points above its exact-reagent accuracy, so when it names the right direction it almost always names the recorded reagent. The rule-based ranker matches the direction on 37.6% of rows. That is the task it is built for, and it is much higher than its 2.9% exact-reagent accuracy: it often points the same way as the recorded reaction and still names a different reagent.
 
 This is a next-reaction and next-product comparison. It is not a claim about the beam-search score in §9.3.
 
@@ -400,7 +404,7 @@ On this suite the two modes finish at the same mean ranking score. The rule-base
 
 Can claim, with the dataset named:
 
-- On the recorded rows behind the confusion figures, architecture 3 names the reagent and the site far more often than the sign ranker and the site shuffle.
+- On the recorded rows behind the confusion figures, architecture 3 names the reagent on 88.8% of rows and the gap direction on 89.1%, against 2.9% and 37.6% for the sign ranker. Given the recorded reagent, its site head matches on 91.2%, against 69.0% for the shuffle.
 
 Cannot claim yet:
 
@@ -433,13 +437,13 @@ Report, on the same test split: reagent top-1, all-three accuracy (site still re
 
 ### 10.2 Site head
 
-The site head is the step from "which reaction" to "which molecule." The offline comparison in §9.2 already shows 0.912 against 0.690 for a shuffle when both methods are handed the recorded reagent. That comparison does not retrain anything and does not close the loop: online, architecture 3 also reorders products by the XGBoost gap after the head has run (§6.4). A lesion has to say which of those two site policies is doing the work.
+The site head is the step from "which reaction" to "which molecule." The offline comparison in §9.2 shows 0.912 against 0.690 for a shuffle when both methods are handed the recorded reagent. Search still uses that head to name a reagent's candidate products, then keeps the candidate whose predicted properties are closest to the target (§6.4). A lesion has to say whether that site choice is what improves the beam.
 
 Three runs. The reagent tower is architecture 3 in every case. The site policy changes.
 
 | Run | Site head | How the product is chosen |
 | --- | --- | --- |
-| B0, reference | trained, cascade from the reagent hidden | highest mean site-head score, then SMARTS; XGBoost reordering as in §6.4 |
+| B0, reference | trained, cascade from the reagent hidden | site head names the products; the one with the lowest MAPE to the target is kept (§6.4) |
 | B1, lesion | not trained; its loss weight is 0 | seeded shuffle of the chosen reagent's products, as in §5.2 |
 | B2, estimator site | not trained | rank the chosen reagent's products by alignment of the XGBoost delta with the gap, with no site head |
 
@@ -578,8 +582,6 @@ Out-of-range targets return HTTP 422.
 | --- | --- |
 | High-level diagram | `docs/architecture/IGNITE_High_Level_Architecture.png` |
 | Modification diagram | `docs/architecture/IGNITE_Modification_Architecture.png` |
-| Module traceability | `docs/architecture/TRACEABILITY.md` |
-| Family and reagent tables | `docs/reaction_families.md`, `docs/reagents.md` |
 | Beam search | `backend/app/services/beam_search.py` |
 | Ranking | `backend/app/services/scoring.py` |
 | Rule-based proposer | `backend/app/services/reagents.py` |
@@ -593,7 +595,7 @@ Out-of-range targets return HTTP 422.
 | Search-trajectory figures | `docs/figures/benchmark_s50_d20_w5_k3/` |
 | Seeds | `data/seeds/energetic_seed_library.csv` |
 | Property models | `models/*.joblib` |
-| Licensing, threat model | `docs/LICENSING.md`, `docs/THREAT_MODEL.md` |
+| License | `LICENCE.md`, `docs/LICENSING.md` |
 
 ---
 

@@ -101,6 +101,42 @@ def test_expand_records_reagent_id(tmp_path: Path):
             assert rec.reaction_family in {p["group"] for p in list_primitives()}
 
 
+def test_expand_keeps_only_children_closer_to_the_target(tmp_path: Path):
+    """Heads propose the reactions. The property model drops any child that is not closer."""
+    from backend.app.domain.models import PredictionSource, PropertyEstimate
+    from backend.app.services.scoring import calculate_mape
+
+    _write_dummy_checkpoint(tmp_path)
+    parent = "c1ccccc1N(=O)=O"
+    props = {"density": 1.5, "det_velocity": 7000.0, "det_pressure": 20.0, "hf_solid": 50.0}
+    targets = {"density": 1.8, "det_velocity": 8500.0, "det_pressure": 30.0, "hf_solid": 100.0}
+    order: list[str] = []
+
+    class _Predictor:
+        def predict(self, smiles: str):
+            if smiles not in order:
+                order.append(smiles)
+            step = min(order.index(smiles), 4) / 4.0
+            values = {key: props[key] + step * (targets[key] - props[key]) for key in props}
+            return {
+                key: PropertyEstimate(value=value, source=PredictionSource.XGBOOST, confidence=1.0)
+                for key, value in values.items()
+            }
+
+    mech = ModificationMechanism(checkpoint_dir=tmp_path, property_predictor=_Predictor())
+    out = mech.expand(parent, props, targets, n=3, mode=ModificationMode.PLANNER)
+    parent_mape = calculate_mape(props, targets)
+    assert out, "expected at least one head proposal that moves toward the target"
+    mapes = []
+    for smi, _ in out:
+        step = min(order.index(smi), 4) / 4.0
+        values = {key: props[key] + step * (targets[key] - props[key]) for key in props}
+        mapes.append(calculate_mape(values, targets))
+    assert mapes == sorted(mapes)
+    assert all(mape < parent_mape for mape in mapes)
+    assert all(order.index(smi) > 0 for smi, _ in out)
+
+
 def test_eval_inference_metrics_oracle_vs_predicted_family():
     from ml.training.train_planner import _eval_inference_metrics
 

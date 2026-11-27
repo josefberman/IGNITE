@@ -76,7 +76,7 @@ def best_epoch(history: list[dict]) -> dict:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data", type=Path, default=ROOT / "data" / "processed" / "modification_pairs.csv")
+    ap.add_argument("--data", type=Path, default=ROOT / "data" / "processed" / "unified_pairs.csv")
     ap.add_argument("--out", type=Path, default=ROOT / "ml" / "checkpoints" / "arch_search")
     ap.add_argument("--layers", type=parse_ints, default=DEFAULT_LAYERS, help="comma-separated message-passing depths")
     ap.add_argument("--hidden", type=parse_ints, default=DEFAULT_HIDDEN, help="comma-separated layer widths")

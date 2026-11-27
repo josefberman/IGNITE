@@ -10,7 +10,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
-from backend.app.domain.models import ModificationMode, ModificationRecord, PROPERTY_KEYS
+from backend.app.domain.models import PROPERTY_KEYS, ModificationMode, ModificationRecord
+from backend.app.services.scoring import calculate_mape
 from backend.app.services.chemistry import (
     edit_distance_proxy,
     sanitize_reaction_product,
@@ -393,64 +394,6 @@ class ModificationMechanism:
         self.rng = rng or random.Random(42)
         self._prims = _primitives_by_family()
 
-    def _reagent_sites_by_gap(
-        self,
-        parent_smiles: str,
-        mol: Chem.Mol,
-        gap_vector: Sequence[float],
-        reagent_id: str,
-    ) -> List[Tuple[str, str]]:
-        """SMARTS products of one reagent, best gap alignment first.
-
-        The template still decides which sites exist. The order is the cosine
-        between each child's predicted property change and the requested gap.
-        """
-        from backend.app.services.reagents import reagent_smarts
-        from ml.site_candidates import reaction_sites
-
-        by_child: Dict[str, str] = {}
-        for cand in reaction_sites(mol, parent_smiles, reagent_smarts(reagent_id)):
-            by_child.setdefault(cand.child, cand.smarts)
-        if not by_child:
-            return []
-        order = self._rank_children(parent_smiles, list(by_child), gap_vector)
-        return [(smi, by_child[smi]) for smi in order]
-
-    def _rank_children(
-        self,
-        parent_smiles: str,
-        children: Sequence[str],
-        gap_vector: Sequence[float],
-    ) -> List[str]:
-        """Keep products whose XGBoost delta points the same way as the requested gap."""
-        predictor = self.property_predictor
-        if predictor is None or not children:
-            return list(children)
-        parent_pred = predictor.predict(parent_smiles)
-        if not parent_pred:
-            return list(children)
-        from ml.planner_gap import PROPERTY_SCALES
-
-        gap = [float(x) for x in gap_vector]
-        gap_norm = sum(x * x for x in gap) ** 0.5
-        scales = [PROPERTY_SCALES[k] for k in PROPERTY_KEYS]
-        scored: List[Tuple[float, str]] = []
-        for smi in children:
-            child_pred = predictor.predict(smi)
-            if not child_pred:
-                scored.append((-1e9, smi))
-                continue
-            raw = [child_pred[k].value - parent_pred[k].value for k in PROPERTY_KEYS]
-            pred = [raw[i] / scales[i] for i in range(len(scales))]
-            pred_norm = sum(x * x for x in pred) ** 0.5
-            if gap_norm < 1e-8 or pred_norm < 1e-8:
-                score = -pred_norm
-            else:
-                score = sum(a * b for a, b in zip(pred, gap)) / (pred_norm * gap_norm)
-            scored.append((score, smi))
-        scored.sort(key=lambda t: -t[0])
-        return [s for _, s in scored]
-
     def _ordered_variants(
         self,
         family_id: str,
@@ -532,6 +475,23 @@ class ModificationMechanism:
         )
         return len(products) >= n
 
+    def _predicted_mape(self, smiles: str, targets: Dict[str, float]) -> Optional[float]:
+        """MAPE of one molecule against the targets, or None if it cannot be predicted."""
+        if self.property_predictor is None:
+            return None
+        predicted = self.property_predictor.predict(smiles)
+        if not predicted:
+            return None
+        values: Dict[str, float] = {}
+        for key in PROPERTY_KEYS:
+            est = predicted.get(key)
+            if est is None:
+                continue
+            values[key] = float(est.value if hasattr(est, "value") else est)
+        if len(values) != len(PROPERTY_KEYS):
+            return None
+        return calculate_mape(values, targets)
+
     def expand(
         self,
         parent_smiles: str,
@@ -566,29 +526,64 @@ class ModificationMechanism:
                 k_families=k_fam,
                 k_reagents=max(2, min(5, n + 1)),
             )
-            # Family and reagent stay in the model's top-1 order. Within one
-            # reagent, the site is the SMARTS child whose property change best
-            # follows the gap. Further slots are the next sites, then the next reagent.
+            # The three heads propose the reactions. With a property model,
+            # return the products whose predicted properties are closer to the
+            # target than the parent, closest first. Without one, keep the
+            # heads' own order.
+            z_enc, atom_emb = self.learned.encode(parent_smiles, gap_vec)
+            proposals: List[Tuple[str, str, str, str]] = []
             for group in families:
                 for reaction_id in reag_by_fam.get(group, []):
                     if reaction_id in tried:
                         continue
                     tried.add(reaction_id)
-                    for smi, smarts in self._reagent_sites_by_gap(
-                        parent_smiles, mol, gap_vec, reaction_id
+                    for smi, smarts in self.learned.rank_reagent_sites(
+                        parent_smiles, mol, gap_vec, reaction_id, z=z_enc, atom_emb=atom_emb
                     ):
-                        if self._accept(
-                            parent_smiles,
-                            smi,
-                            family=group,
-                            reagent=reaction_id,
-                            smarts=smarts,
-                            planner="learned",
-                            seen=seen,
-                            products=products,
-                            n=n,
-                        ):
-                            return products[:n]
+                        proposals.append((smi, group, reaction_id, smarts))
+            if self.property_predictor is None:
+                for smi, group, reaction_id, smarts in proposals:
+                    if self._accept(
+                        parent_smiles,
+                        smi,
+                        family=group,
+                        reagent=reaction_id,
+                        smarts=smarts,
+                        planner="learned",
+                        seen=seen,
+                        products=products,
+                        n=n,
+                    ):
+                        break
+                return products[:n]
+            parent_mape = calculate_mape(parent_props, targets)
+            ranked: List[Tuple[float, str, str, str, str]] = []
+            proposed: set[str] = set()
+            for smi, group, reaction_id, smarts in proposals:
+                vr = validate_molecule(smi, parent_smiles=parent_smiles)
+                if not vr.valid or not vr.canonical_smiles or vr.canonical_smiles in seen:
+                    continue
+                if vr.canonical_smiles in proposed:
+                    continue
+                child_mape = self._predicted_mape(vr.canonical_smiles, targets)
+                if child_mape is None or not child_mape < parent_mape:
+                    continue
+                proposed.add(vr.canonical_smiles)
+                ranked.append((child_mape, vr.canonical_smiles, group, reaction_id, smarts))
+            ranked.sort(key=lambda item: item[0])
+            for _, smi, group, reaction_id, smarts in ranked:
+                if self._accept(
+                    parent_smiles,
+                    smi,
+                    family=group,
+                    reagent=reaction_id,
+                    smarts=smarts,
+                    planner="learned",
+                    seen=seen,
+                    products=products,
+                    n=n,
+                ):
+                    break
             return products[:n]
 
         # Rule-based: reagent level only. Rank reagents by whether their documented

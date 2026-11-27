@@ -289,7 +289,7 @@ def write_markdown(rows: list[dict], args) -> None:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data", type=Path, default=ROOT / "data" / "processed" / "modification_pairs.csv")
+    ap.add_argument("--data", type=Path, default=ROOT / "data" / "processed" / "unified_pairs.csv")
     ap.add_argument("--out", type=Path, default=ROOT / "output" / "multitask_search")
     ap.add_argument("--results", type=Path, default=ROOT / "docs" / "multitask_search.csv")
     ap.add_argument("--stage", choices=("1", "2", "3", "4", "none", "all"), default="all")

@@ -1,14 +1,9 @@
 """Rule-based modifier: a flat list of reagents and their property effects.
 
-Source of truth: ``docs/reagents.md``. Each reagent's four effects
-(density, det_velocity, det_pressure, hf_solid) were copied from the Direction
-column of ``docs/reaction_families.md``; the reaction itself (SMARTS) comes from
-``backend/app/services/reaction_primitives.py`` by reagent id. Every reagent
-lists all four effects as ``raise``, ``lower``, or ``neutral``; nothing here is
-inferred.
-
-The rule-based path works only at the reagent level. Reaction families take no
-part in ranking or applying a reagent.
+Each reagent's four effects (density, det_velocity, det_pressure, hf_solid)
+match the primitive delta in ``reaction_primitives.py`` for the same reagent id.
+Every reagent lists all four effects as ``raise``, ``lower``, or ``neutral``.
+The rule-based path does not consult reaction families.
 """
 
 from __future__ import annotations
@@ -51,7 +46,7 @@ def _r(reagent_id: str, density: str, det_velocity: str, det_pressure: str, hf_s
     )
 
 
-# (density, det_velocity, det_pressure, hf_solid) — see docs/reagents.md.
+# (density, det_velocity, det_pressure, hf_solid)
 REAGENTS: List[Reagent] = [
     _r("nitrate_arom_CH", RAISE, RAISE, RAISE, NEUTRAL),
     _r("nitrate_alkyl_CH", RAISE, RAISE, RAISE, NEUTRAL),

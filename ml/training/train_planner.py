@@ -681,7 +681,7 @@ if __name__ == "__main__":
         "--arch", choices=("legacy", "multitask"), default="legacy",
         help="legacy: ModificationPlanner, per-pair loop. multitask: MultitaskPlanner, batched trainer",
     )
-    ap.add_argument("--data", type=Path, default=Path("data/processed/modification_pairs.csv"))
+    ap.add_argument("--data", type=Path, default=Path("data/processed/unified_pairs.csv"))
     ap.add_argument("--out", type=Path, default=None, help="default ml/checkpoints (legacy), output/multitask (multitask)")
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--patience", type=int, default=7)

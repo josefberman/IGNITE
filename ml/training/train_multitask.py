@@ -350,7 +350,7 @@ def train_multitask(
         n = 0
         t0 = time.time()
         for s in range(0, len(order), batch_size):
-            b = cache.batch(order[s : s + batch_size])
+            b = cache.batch(order[s : s + batch_size], train=True, rng=rng)
             o = _forward(model, b, fam_pool, eval_mode=False)
             lf, lr_, ls = o["l_fam"].mean(), o["l_reag"].mean(), o["l_site"].mean()
             if log_vars is None:
@@ -443,7 +443,7 @@ def train_multitask(
         "site_supervision": True,
         "reagent_supervision": True,
         **arch_meta,
-        "planner_gap": "signed_normalized",
+        "planner_gap": "signed_normalized_gap_reducing_target",
         "train_hparams": hparams,
         "split": split_info,
         "best_epoch": best["epoch"],
